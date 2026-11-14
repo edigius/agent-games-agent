@@ -5,6 +5,7 @@
  * (or anywhere in the repo) may contain a real secret or a placeholder that
  * looks like one. Booleans about secret presence are logged; values never are.
  */
+import { parseStrategySalt } from './commitment.js';
 
 // Registered verification-key hashes, published on zkVerify mainnet and
 // served as JSON from https://agentgames.zkverify.io/api/circuit-info.
@@ -57,13 +58,20 @@ export function loadConfig(env = process.env) {
         'Never commit it.',
     );
   }
+  // Same fail-fast discipline as the HMAC secret: without the salt no
+  // Steal turn proof can match the registered commitment, so booting
+  // without it would silently degrade every match. parseStrategySalt
+  // throws on missing/invalid/out-of-field values (never echoing it).
+  const strategySalt = parseStrategySalt(env.STRATEGY_SALT);
   return Object.freeze({
     hmacSecret: secret,
+    strategySalt,
     kurierApiKey: env.KURIER_API_KEY ?? '',
     kurierApiUrl: env.KURIER_API_URL ?? KURIER_API_URL,
     port: Number(env.PORT ?? 8080),
     seenSetPath: env.SEEN_SET_PATH ?? 'data/seen-set.json',
     // Presence flags only — safe to log.
     hasKurierKey: Boolean(env.KURIER_API_KEY),
+    hasStrategySalt: true,
   });
 }

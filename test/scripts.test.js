@@ -5,17 +5,44 @@ import { promisify } from 'node:util';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { computeCommitment } from '../scripts/commitment.js';
-import { resolveTurn, runSimulation } from '../scripts/simulate.js';
+import { resolveTurn, runSimulation, searchStrategies } from '../scripts/simulate.js';
 
 const run = promisify(execFile);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 describe('commitment CLI', () => {
-  it('refuses to compute a hash while the preimage layout is unknown', () => {
-    assert.throws(() => computeCommitment({}, 'salt'), /preimage layout is UNKNOWN/);
+  it('computes the confirmed Poseidon commitment (discovery witness)', async () => {
+    assert.equal(
+      await computeCommitment([1, 0, 0, 0, 0, 0, 0, 0], 0n),
+      '11299471465817035813941534680224295417418949445559228777402254279479107204147',
+    );
   });
 
-  it('exits non-zero with a refusal message (never prints params or salt)', async () => {
+  it('prints ONLY the hash and never the salt or params', async () => {
+    const { stdout, stderr } = await run('node', ['scripts/commitment.js'], {
+      cwd: ROOT,
+      env: { ...process.env, STRATEGY_SALT: '424242' },
+    });
+    assert.match(stdout, /^\d+\n$/);
+    assert.equal(stderr, '');
+    assert.doesNotMatch(stdout, /424242/);
+  });
+
+  it('exits non-zero when STRATEGY_SALT is missing, without printing a hash', async () => {
+    const env = { ...process.env };
+    delete env.STRATEGY_SALT;
+    await assert.rejects(
+      run('node', ['scripts/commitment.js'], { cwd: ROOT, env }),
+      (err) => {
+        assert.match(err.stderr, /refused/);
+        assert.match(err.stderr, /STRATEGY_SALT is not set/);
+        assert.equal(err.stdout, '');
+        return true;
+      },
+    );
+  });
+
+  it('refuses an invalid salt without echoing it', async () => {
     await assert.rejects(
       run('node', ['scripts/commitment.js'], {
         cwd: ROOT,
@@ -72,5 +99,42 @@ describe('simulator', () => {
       'random',
       'tit-for-tat',
     ]);
+  });
+
+  it('passes explicit params through to the policy', () => {
+    const baseline = runSimulation({ matches: 20, seed: 42 });
+    const passive = runSimulation({
+      matches: 20,
+      seed: 42,
+      params: [10, 0, 0, 1, 0, 0, 0, 0],
+    });
+    assert.notDeepEqual(passive, baseline);
+    // Passive never extracts: vs always-hold every match draws 100-100.
+    assert.deepEqual(
+      [passive['always-hold'].wins, passive['always-hold'].draws, passive['always-hold'].losses],
+      [0, 20, 0],
+    );
+  });
+
+  it('staged search is deterministic and returns a valid ranked winner', () => {
+    const opts = {
+      seed: 7,
+      coarseMatches: 5,
+      refineMatches: 5,
+      verifyMatches: 5,
+      coarseGrid: { p0: [1, 10], p1: [0, 50], p2: [0, 50], p3: [0, 1] },
+    };
+    const a = searchStrategies(opts);
+    const b = searchStrategies(opts);
+    assert.deepEqual(a, b);
+    assert.equal(a.coarse.length, 16);
+    assert.ok(a.refined.length > 0);
+    assert.ok(a.verified.length > 0 && a.verified.length <= 6);
+    assert.equal(a.winner.params.length, 8);
+    assert.deepEqual(a.winner.params.slice(4), [0, 0, 0, 0]);
+    assert.equal(
+      a.winner.totalWins + a.winner.totalDraws + a.winner.totalLosses,
+      5 * 5,
+    );
   });
 });

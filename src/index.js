@@ -1,9 +1,11 @@
 /**
  * PEGASUS — entry point. Wires config, state, Kurier, and the HTTP server.
- * Fails fast when the HMAC secret is missing; warns (and degrades proof
- * submission) when the Kurier key is missing.
+ * Fails fast when the HMAC secret or strategy salt is missing, or when the
+ * strategy params are invalid; warns (and degrades proof submission) when
+ * the Kurier key is missing.
  */
 import { loadConfig } from './config.js';
+import { STRATEGY_PARAMS, validateStrategyParams } from './strategyParams.js';
 import { SeenSet } from './seenSet.js';
 import { KurierClient } from './kurier.js';
 import { createServer } from './server.js';
@@ -14,6 +16,10 @@ function log(event, fields = {}) {
 
 async function main() {
   const config = loadConfig();
+
+  // Refuse to boot on invalid strategy params: an unprovable policy
+  // would degrade every Steal turn. Throws -> fatal exit below.
+  validateStrategyParams(STRATEGY_PARAMS);
 
   const seenSet = new SeenSet(config.seenSetPath);
   await seenSet.load();

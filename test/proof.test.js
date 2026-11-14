@@ -1,42 +1,118 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  CircuitMappingError,
   buildCircuitInput,
   defaultProofProvider,
   proveAndSubmit,
 } from '../src/proof.js';
+import { computeCommitment } from '../src/commitment.js';
 import { KurierClient, KurierError } from '../src/kurier.js';
+import { stealEnvelope } from './helpers.js';
 
-describe('proof adapter (vfy-policy mapping still unknown)', () => {
-  it('buildCircuitInput throws a clear NOT_IMPLEMENTED error for vfyPolicy', () => {
-    assert.throws(() => buildCircuitInput('vfyPolicy', {}), CircuitMappingError);
-    assert.throws(() => buildCircuitInput('vfyPolicy', {}), /NOT IMPLEMENTED/);
-    assert.throws(() => buildCircuitInput('vfyPolicy', {}), /vfyPolicy/);
+describe('proof adapter: vfyPolicy input validation (no proving)', () => {
+  const PARAMS = [5, 50, 100, 0, 0, 0, 0, 0];
+  const SALT = 12345n;
+
+  async function validData(overrides = {}) {
+    const hash = await computeCommitment(PARAMS, SALT);
+    return {
+      envelope: stealEnvelope(
+        {},
+        { strategyCommitment: { hash } },
+      ),
+      action: { type: 'EXTRACT', amount: 5 },
+      params: PARAMS,
+      salt: SALT,
+      ...overrides,
+    };
+  }
+
+  it('builds the 17-slot input with the confirmed encodings', async () => {
+    const input = await buildCircuitInput('vfyPolicy', await validData());
+    assert.deepEqual(Object.keys(input), [
+      'commitment',
+      'matchId',
+      'turnNumber',
+      'selfBalance',
+      'opponentBalance',
+      'action',
+      'amount',
+      'circuitVersion',
+      'salt',
+      'strategyParams',
+    ]);
+    assert.equal(input.commitment, await computeCommitment(PARAMS, SALT));
+    // matchId: UUID hyphens stripped, as a decimal integer string.
+    assert.equal(input.matchId, BigInt(`0x${'9f4e1b2a000040008000000000000001'}`).toString());
+    assert.equal(input.turnNumber, '3');
+    assert.equal(input.selfBalance, '95');
+    assert.equal(input.opponentBalance, '105');
+    assert.equal(input.action, '2');
+    assert.equal(input.amount, '5');
+    assert.equal(input.circuitVersion, '1');
+    assert.equal(input.salt, '12345');
+    assert.deepEqual(input.strategyParams, ['5', '50', '100', '0', '0', '0', '0', '0']);
   });
 
-  it('proveAndSubmit surfaces the mapping error for vfyPolicy (does not guess)', async () => {
+  it('refuses when the envelope commitment does not match the local one', async () => {
+    const data = await validData();
+    data.envelope.strategyCommitment = { hash: '999' };
+    await assert.rejects(buildCircuitInput('vfyPolicy', data), /does not match/);
+  });
+
+  it('refuses without a BigInt salt, and with invalid params', async () => {
+    const noSalt = await validData({ salt: undefined });
+    await assert.rejects(buildCircuitInput('vfyPolicy', noSalt), /salt/);
+    const stringSalt = await validData({ salt: '12345' });
+    await assert.rejects(buildCircuitInput('vfyPolicy', stringSalt), /salt/);
+    const badParams = await validData({ params: [0, 0, 0, 0, 0, 0, 0, 0] });
+    await assert.rejects(buildCircuitInput('vfyPolicy', badParams), /p0/);
+  });
+
+  it('refuses malformed matchId, turn, balances, and actions', async () => {
+    const base = await validData();
     await assert.rejects(
-      proveAndSubmit({ circuit: 'vfyPolicy', data: {}, kurier: null, deadlineMs: 1000 }),
-      CircuitMappingError,
+      buildCircuitInput('vfyPolicy', {
+        ...base,
+        envelope: { ...base.envelope, matchId: 'not-a-uuid!' },
+      }),
+      /matchId/,
+    );
+    await assert.rejects(
+      buildCircuitInput('vfyPolicy', { ...base, action: { type: 'DANCE' } }),
+      /HOLD\|FORTIFY\|EXTRACT/,
+    );
+    await assert.rejects(
+      buildCircuitInput('vfyPolicy', {
+        ...base,
+        action: { type: 'EXTRACT' }, // missing amount
+      }),
+      /amount/,
+    );
+    await assert.rejects(
+      buildCircuitInput('vfyPolicy', {
+        ...base,
+        envelope: stealEnvelope({ selfBalance: '-1' }, {
+          strategyCommitment: base.envelope.strategyCommitment,
+        }),
+      }),
+      /non-negative/,
     );
   });
 
-  it('defaultProofProvider degrades to null evidence for vfyPolicy instead of throwing', async () => {
-    const evidence = await defaultProofProvider({
-      circuit: 'vfyPolicy',
-      data: {},
-      kurier: null,
-      deadlineMs: 1000,
-    });
-    assert.equal(evidence.proof, null);
-    assert.equal(evidence.publicSignals, null);
-    assert.equal(evidence.degraded, true);
-    assert.equal(evidence.kurierStatus, 'mapping_unimplemented');
+  it('proveAndSubmit surfaces input errors (never degrades silently)', async () => {
+    await assert.rejects(
+      proveAndSubmit({ circuit: 'vfyPolicy', data: {}, kurier: null, deadlineMs: 1000 }),
+      /salt/,
+    );
+    await assert.rejects(
+      defaultProofProvider({ circuit: 'vfyPolicy', data: {}, kurier: null, deadlineMs: 1000 }),
+      /salt/,
+    );
   });
 
-  it('rejects unknown circuit names', () => {
-    assert.throws(() => buildCircuitInput('nope', {}), /unknown circuit/);
+  it('rejects unknown circuit names', async () => {
+    await assert.rejects(buildCircuitInput('nope', {}), /unknown circuit/);
   });
 });
 

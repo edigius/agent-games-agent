@@ -37,10 +37,37 @@
  * isolated toField() below; if practice feedback shows a different
  * encoding, change ONLY that function.
  *
- * VFY-POLICY MAPPING — STILL UNKNOWN (discovery running separately).
- * buildCircuitInput() throws CircuitMappingError for 'vfyPolicy', and the
- * server degrades to proof-less turn responses until it is implemented.
- * Do not guess the mapping.
+ * VFY-POLICY MAPPING — CONFIRMED by local fullProve+verify experiments
+ * against the downloaded artifacts (snarkjs 0.7.6, verify=true with the
+ * exported VK), 15 Nov 2026. No platform contact was involved.
+ *   Inputs (17 slots): commitment, matchId, turnNumber, selfBalance,
+ *     opponentBalance, action, amount, circuitVersion, salt (scalars) +
+ *     strategyParams (array of exactly 8).
+ *   commitment = Poseidon([strategyParams[0..7], salt]), arity 9, salt
+ *     LAST — computed ONLY via the shared module src/commitment.js (the
+ *     same code the commitment CLI uses), never duplicated here. The
+ *     built input is cross-checked against the envelope's registered
+ *     strategyCommitment.hash when present; a mismatch refuses to prove.
+ *   matchId = UUID with hyphens stripped, as a decimal integer string.
+ *   action: 0 = HOLD, 1 = FORTIFY, 2 = EXTRACT. amount is EXACTLY p0 for
+ *     EXTRACT, 0 for HOLD/FORTIFY (the circuit enforces both). The
+ *     policy rule itself lives in src/steal.js; this adapter only
+ *     encodes the action it is given, and the circuit rejects any
+ *     action the policy would not produce — so a proof can never be
+ *     emitted for a non-policy action.
+ *   circuitVersion = 1 ("v1"). salt comes from STRATEGY_SALT (BigInt,
+ *     fail-fast at startup like the HMAC secret) and is passed in
+ *     through the proof data — never read from the environment here.
+ *   Public signals (9, in order): [bindingHash, commitment, matchId,
+ *     turnNumber, selfBalance, opponentBalance, action, amount,
+ *     circuitVersion], where bindingHash =
+ *     Poseidon([matchId, turnNumber, circuitVersion]), arity 3. salt
+ *     and strategyParams are PRIVATE. generateProof() echo-asserts ALL
+ *     9 positions (recomputing the binding hash), failing loudly on
+ *     wiring bugs instead of submitting a proof of the wrong statement.
+ *   Proof generation failure (e.g. a fail-closed HOLD the circuit
+ *   rejects) propagates as an error: the server degrades to a
+ *   proof-less turn response and logs loudly. Evidence is never faked.
  *
  * Deadline discipline: proof generation + Kurier submission + opportunistic
  * polling must fit inside the caller's budget. The response is NEVER held
@@ -51,6 +78,9 @@
 import { keccak256 } from 'js-sha3';
 import { CIRCUIT } from './config.js';
 import { KurierClient } from './kurier.js';
+import { computeBindingHash, computeCommitment } from './commitment.js';
+import { STRATEGY_PARAMS, validateStrategyParams } from './strategyParams.js';
+import { ACTION_TYPE } from './steal.js';
 
 export const BN128_FIELD_MODULUS =
   21888242871839275222246405745257275088548364400416034343698204186575808495617n;
@@ -58,18 +88,6 @@ export const BN128_FIELD_MODULUS =
 // Fixed gatekeeper salt (see header). Any salt works; fixed keeps the
 // binding hash deterministic per task and needs no salt management.
 const GATEKEEPER_SALT = 1n;
-
-export class CircuitMappingError extends Error {
-  constructor(circuit) {
-    super(
-      `Circuit input mapping for "${circuit}" is NOT IMPLEMENTED: the ` +
-        'official signal names/order are unpublished. See src/proof.js header. ' +
-        'Refusing to guess — proof evidence unavailable in this mode.',
-    );
-    this.name = 'CircuitMappingError';
-    this.circuit = circuit;
-  }
-}
 
 function keccakToField(bytes) {
   return BigInt(`0x${keccak256(bytes)}`) % BN128_FIELD_MODULUS;
@@ -143,13 +161,107 @@ function buildGatekeeperInput(data) {
   };
 }
 
+function parseNonNegativeInteger(value, field) {
+  let n;
+  try {
+    n = BigInt(value);
+  } catch {
+    throw new Error(`vfyPolicy input ${field} is not an integer: ${String(value)}`);
+  }
+  if (n < 0n) {
+    throw new Error(`vfyPolicy input ${field} must be non-negative, got ${String(value)}`);
+  }
+  return n;
+}
+
+// matchId: UUID with hyphens stripped, interpreted as hex, passed to the
+// circuit as a decimal integer string (CONFIRMED encoding).
+function parseMatchId(matchId) {
+  const s = String(matchId ?? '').trim();
+  const hex = s.replace(/^0x/i, '').replace(/-/g, '');
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error('vfyPolicy input matchId is not a UUID (hex with hyphens)');
+  }
+  return BigInt(`0x${hex}`).toString();
+}
+
+async function buildVfyPolicyInput(data) {
+  const envelope = data?.envelope ?? {};
+  const action = data?.action ?? {};
+  const params = data?.params ?? STRATEGY_PARAMS;
+  validateStrategyParams(params);
+
+  const salt = data?.salt;
+  if (typeof salt !== 'bigint') {
+    throw new Error(
+      'vfyPolicy proof requires the strategy salt as a BigInt in data.salt ' +
+        '(STRATEGY_SALT must be set; see src/config.js).',
+    );
+  }
+  if (salt < 0n || salt >= BN128_FIELD_MODULUS) {
+    throw new Error('vfyPolicy proof: strategy salt out of BN128 field range.');
+  }
+
+  // Commitment via the shared module ONLY — the same computation the
+  // commitment CLI performs, so proofs match the registered hash.
+  const commitment = await computeCommitment(params, salt);
+
+  // Cross-check against the registered hash the platform sent, when
+  // present. A mismatch means the salt/params do not match the dashboard
+  // registration: proving would produce evidence the platform rejects,
+  // so refuse loudly instead of emitting a useless proof.
+  const envelopeHash = envelope.strategyCommitment?.hash;
+  if (envelopeHash !== null && envelopeHash !== undefined && String(envelopeHash) !== '') {
+    let registered;
+    try {
+      registered = BigInt(envelopeHash);
+    } catch {
+      throw new Error('strategyCommitment.hash is not parseable as an integer');
+    }
+    if (registered !== BigInt(commitment)) {
+      throw new Error(
+        'local commitment does not match the registered strategyCommitment.hash: ' +
+          'check STRATEGY_SALT and strategy params against the dashboard registration.',
+      );
+    }
+  }
+
+  const actionCode = ACTION_TYPE[action.type];
+  if (actionCode === undefined) {
+    throw new Error(`vfyPolicy proof requires action HOLD|FORTIFY|EXTRACT, got ${String(action.type)}`);
+  }
+  // EXTRACT amount must come from the policy output; the circuit itself
+  // enforces amount == p0, so a wrong amount fails proving (never a
+  // proof for a non-policy action). HOLD/FORTIFY always carry 0.
+  const amount =
+    action.type === 'EXTRACT'
+      ? parseNonNegativeInteger(action.amount, 'amount')
+      : 0n;
+
+  return {
+    commitment,
+    matchId: parseMatchId(envelope.matchId),
+    turnNumber: parseNonNegativeInteger(envelope.turn, 'turn').toString(),
+    selfBalance: parseNonNegativeInteger(envelope.state?.selfBalance, 'selfBalance').toString(),
+    opponentBalance: parseNonNegativeInteger(
+      envelope.state?.opponentBalance,
+      'opponentBalance',
+    ).toString(),
+    action: String(actionCode),
+    amount: amount.toString(),
+    circuitVersion: '1',
+    salt: salt.toString(),
+    strategyParams: params.map((p) => BigInt(p).toString()),
+  };
+}
+
 /**
- * Map task/turn data to the circuit's snarkjs input object.
- * @throws {CircuitMappingError} for 'vfyPolicy' (mapping unknown).
+ * Map task/turn data to the circuit's snarkjs input object. Async:
+ * the vfyPolicy branch computes a Poseidon commitment.
  */
-export function buildCircuitInput(circuit, data) {
+export async function buildCircuitInput(circuit, data) {
   if (circuit === 'gatekeeper') return buildGatekeeperInput(data);
-  if (circuit === 'vfyPolicy') throw new CircuitMappingError(circuit);
+  if (circuit === 'vfyPolicy') return buildVfyPolicyInput(data);
   throw new Error(`unknown circuit: ${String(circuit)}`);
 }
 
@@ -186,12 +298,55 @@ function assertGatekeeperSignals(input, signals) {
   }
 }
 
+async function assertVfyPolicySignals(input, signals) {
+  if (signals.length !== CIRCUIT.vfyPolicy.nPublic) {
+    throw new Error(
+      `vfyPolicy proof has ${signals.length} public signals, expected ${CIRCUIT.vfyPolicy.nPublic}`,
+    );
+  }
+  // signals[0] is the binding hash Poseidon([matchId, turnNumber,
+  // circuitVersion]) — recomputed here, not trusted from the prover.
+  const expectedSig0 = await computeBindingHash(
+    input.matchId,
+    input.turnNumber,
+    input.circuitVersion,
+  );
+  if (signals[0] !== expectedSig0) {
+    throw new Error(
+      'vfyPolicy public signal[0] (binding hash) mismatch: the proof is not ' +
+        'bound to this match/turn/version — refusing to use it.',
+    );
+  }
+  // signals[1..8] must echo the inputs, in the confirmed order.
+  const expected = [
+    input.commitment,
+    input.matchId,
+    input.turnNumber,
+    input.selfBalance,
+    input.opponentBalance,
+    input.action,
+    input.amount,
+    input.circuitVersion,
+  ];
+  const actual = signals.slice(1);
+  for (let i = 0; i < expected.length; i += 1) {
+    if (actual[i] !== expected[i]) {
+      throw new Error(
+        `vfyPolicy public signal[${i + 1}] mismatch: expected ${expected[i]}, got ${actual[i]}. ` +
+          'The proof would state different facts than the turn — refusing to use it.',
+      );
+    }
+  }
+}
+
 /**
  * Generate a Groth16 proof with the downloaded artifacts.
  * @returns {{proof: object, publicSignals: string[]}}
+ * @throws when the witness fails (e.g. the circuit rejects the action)
+ *   or a public-signal echo check fails. Callers degrade loudly.
  */
 export async function generateProof(circuit, data) {
-  const input = buildCircuitInput(circuit, data);
+  const input = await buildCircuitInput(circuit, data);
   const artifacts = CIRCUIT[circuit];
   const snarkjs = await import('snarkjs');
   const { proof, publicSignals } = await snarkjs.groth16.fullProve(
@@ -201,6 +356,7 @@ export async function generateProof(circuit, data) {
   );
   const signals = publicSignals.map(String);
   if (circuit === 'gatekeeper') assertGatekeeperSignals(input, signals);
+  if (circuit === 'vfyPolicy') await assertVfyPolicySignals(input, signals);
   return { proof, publicSignals: signals };
 }
 
@@ -212,7 +368,8 @@ export async function generateProof(circuit, data) {
  *   deadlineMs, onEvent }
  * @returns {{proof, publicSignals, proofReference, kurierStatus,
  *   kurierFinalized}}
- * @throws {CircuitMappingError} when the mapping is unimplemented.
+ * @throws when proof generation fails (witness rejection, bad input).
+ *   Kurier failures never throw: the proof still rides in the response.
  */
 export async function proveAndSubmit({
   circuit,
@@ -265,23 +422,10 @@ export async function proveAndSubmit({
 
 /**
  * Default proof provider used by the server. Swappable in tests.
- * Returns null evidence on CircuitMappingError (degraded mode) instead of
- * throwing, so handlers stay simple. Other errors propagate.
+ * Proof-generation failures propagate: the server catches them, logs
+ * loudly, and degrades to a proof-less (but schema-valid) response.
+ * Evidence is never faked or silently degraded here.
  */
 export async function defaultProofProvider(opts) {
-  try {
-    return await proveAndSubmit(opts);
-  } catch (err) {
-    if (err instanceof CircuitMappingError) {
-      return {
-        proof: null,
-        publicSignals: null,
-        proofReference: null,
-        kurierStatus: 'mapping_unimplemented',
-        kurierFinalized: false,
-        degraded: true,
-      };
-    }
-    throw err;
-  }
+  return proveAndSubmit(opts);
 }

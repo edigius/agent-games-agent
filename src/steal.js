@@ -1,11 +1,19 @@
 /**
  * PEGASUS — Steal the VFY: policy, publicInputsHash, response shaping.
  *
- * Policy: a pure, deterministic function of the envelope state and
- * STRATEGY_PARAMS. It must match the vfy-policy circuit exactly — including
- * the extraction amount and the FORTIFY logic — so it is kept isolated,
- * dependency-free, and exhaustively tested. No history, no randomness, no
- * I/O inside the policy.
+ * Policy: the EXACT rule enforced by the vfy-policy circuit (confirmed
+ * by local fullProve+verify experiments, 15 Nov 2026), parameterized by
+ * the 8 values in STRATEGY_PARAMS (only p0..p3 are live knobs; p4..p7
+ * are reserved 0). In precedence order:
+ *   if selfBalance < p1:          FORTIFY, amount 0
+ *   elif opponentBalance <= p2:   HOLD, amount 0
+ *   elif p3 == 1:                 HOLD, amount 0
+ *   else:                         EXTRACT, amount p0
+ * Boundaries are strict as written. Turn number and fortification state
+ * do NOT affect the policy: they are not policy inputs in the circuit,
+ * so the policy function must never read them. The policy is pure and
+ * deterministic: same balances + params -> same action, always. No
+ * history, no randomness, no I/O inside the policy.
  *
  * publicInputsHash: keccak256 over 8 ABI-packed fields, each 32 bytes
  * big-endian, in the EXACT order published on /build:
@@ -18,7 +26,7 @@
 import { randomUUID } from 'node:crypto';
 import { keccak256 } from 'js-sha3';
 import { CIRCUIT_VERSION } from './config.js';
-import { STRATEGY_PARAMS } from './strategyParams.js';
+import { STRATEGY_PARAMS, validateStrategyParams } from './strategyParams.js';
 
 export const ACTION_TYPE = Object.freeze({
   HOLD: 0,
@@ -38,32 +46,27 @@ function toBigInt(value, field) {
 }
 
 /**
- * Pure policy: state + params -> action.
- * @param {object} state - envelope `state` object.
- * @param {object} params - STRATEGY_PARAMS (defaults to the module values).
+ * Pure policy: state + params -> action. Implements the circuit rule
+ * exactly; any deviation means the turn proof fails in-circuit, so the
+ * rule below must never drift from the confirmed mapping.
+ * @param {object} state - envelope `state` object (balances only; turn
+ *   and fortify fields are ignored by design).
+ * @param {Array<number|bigint>} params - 8 strategy params (defaults to
+ *   the module values). Validated on every call.
  * @returns {{type: 'HOLD'|'FORTIFY'|'EXTRACT', amount?: number}}
  */
 export function policy(state, params = STRATEGY_PARAMS) {
+  validateStrategyParams(params);
+  const [p0, p1, p2, p3] = params.map((p) => BigInt(p));
   const self = toBigInt(state.selfBalance, 'selfBalance');
   const opp = toBigInt(state.opponentBalance, 'opponentBalance');
-  const turn = Number(state.turn);
-  const lead = self - opp;
-  const isEndgame = turn >= params.TOTAL_TURNS - params.ENDGAME_TURNS;
-
-  // Broke: must extract, fortifying concedes the match.
-  if (self <= BigInt(params.LOW_BALANCE_THRESHOLD)) {
-    return { type: 'EXTRACT', amount: params.EXTRACT_AMOUNT };
+  if (self < 0n || opp < 0n) {
+    throw new Error('steal state balances must be non-negative integers');
   }
-  // Endgame: protect any lead; behind -> extract.
-  if (isEndgame) {
-    if (lead > 0n) return { type: 'FORTIFY' };
-    return { type: 'EXTRACT', amount: params.EXTRACT_AMOUNT };
-  }
-  // Mid-game: protect a comfortable lead, otherwise extract.
-  if (lead >= BigInt(params.LEAD_FORTIFY_THRESHOLD)) {
-    return { type: 'FORTIFY' };
-  }
-  return { type: 'EXTRACT', amount: params.EXTRACT_AMOUNT };
+  if (self < p1) return { type: 'FORTIFY' };
+  if (opp <= p2) return { type: 'HOLD' };
+  if (p3 === 1n) return { type: 'HOLD' };
+  return { type: 'EXTRACT', amount: Number(p0) };
 }
 
 /** Fail-closed wrapper: any policy error degrades to HOLD, never a crash. */

@@ -33,6 +33,7 @@ import {
   computePublicInputsHash,
   safePolicy,
 } from './steal.js';
+import { STRATEGY_PARAMS } from './strategyParams.js';
 import { defaultProofProvider } from './proof.js';
 
 const STARTED_AT = Date.now();
@@ -198,7 +199,7 @@ export function createServer({
       publicSignals: evidence?.publicSignals ?? null,
       kurierStatus: evidence?.kurierStatus ?? null,
       kurierFinalized: evidence?.kurierFinalized ?? false,
-      proofDegraded: evidence?.degraded ?? true,
+      proofDegraded: !evidence?.proof,
       durationMs: Date.now() - started,
     });
     return { status: 200, payload };
@@ -231,14 +232,31 @@ export function createServer({
     try {
       evidence = await proofProvider({
         circuit: 'vfyPolicy',
-        data: { envelope, action, publicInputsHash },
+        data: {
+          envelope,
+          action,
+          publicInputsHash,
+          params: STRATEGY_PARAMS,
+          salt: config.strategySalt,
+        },
         kurier,
         deadlineMs: remaining,
         onEvent: (event, fields) =>
           log(`steal_proof_${event}`, { matchId, turn, ...fields }),
       });
     } catch (err) {
-      log('steal_proof_error', { matchId, turn, error: err.message });
+      // Proof generation failed (e.g. the circuit rejected a fail-closed
+      // HOLD, or the salt/params do not match the registered
+      // commitment). Degrade LOUDLY to a proof-less turn response —
+      // never emit a proof for an action the circuit rejects, never
+      // fake evidence. The response below carries no proof fields.
+      log('steal_proof_error', {
+        matchId,
+        turn,
+        action: action.type,
+        error: err.message,
+        degraded: true,
+      });
     }
 
     const payload = buildTurnResponse({
@@ -260,7 +278,7 @@ export function createServer({
       publicSignals: evidence?.publicSignals ?? null,
       kurierStatus: evidence?.kurierStatus ?? null,
       kurierFinalized: evidence?.kurierFinalized ?? false,
-      proofDegraded: evidence?.degraded ?? true,
+      proofDegraded: !evidence?.proof,
       durationMs: Date.now() - started,
     });
     return { status: 200, payload };
@@ -371,6 +389,7 @@ export function createServer({
       name: 'PEGASUS',
       uptimeMs: Date.now() - STARTED_AT,
       hmacConfigured: Boolean(config.hmacSecret),
+      strategySaltConfigured: typeof config.strategySalt === 'bigint',
       kurierKeyConfigured: config.hasKurierKey,
       circuitsPresent,
       seenSetSize: seenSet.size,

@@ -112,7 +112,7 @@ describe('publicInputsHash', () => {
   });
 });
 
-describe('policy', () => {
+describe('policy (confirmed circuit rule)', () => {
   const state = (overrides) => ({
     selfBalance: '100',
     opponentBalance: '100',
@@ -121,49 +121,114 @@ describe('policy', () => {
     turn: 3,
     ...overrides,
   });
+  // p0=5, p1=50, p2=100, p3=0: exercises every branch.
+  const P = [5, 50, 100, 0, 0, 0, 0, 0];
 
-  it('is deterministic', () => {
+  it('is deterministic and ignores turn + fortify flags', () => {
     const s = state({ selfBalance: '120', opponentBalance: '80' });
-    assert.deepEqual(policy(s), policy(s));
-    assert.deepEqual(policy(s, STRATEGY_PARAMS), policy(s, { ...STRATEGY_PARAMS }));
+    assert.deepEqual(policy(s, P), policy(s, P));
+    assert.deepEqual(
+      policy(state({ selfBalance: '120', opponentBalance: '80', turn: 1 }), P),
+      policy(
+        state({
+          selfBalance: '120',
+          opponentBalance: '80',
+          turn: 19,
+          selfFortifiedUntilTurn: 19,
+          opponentFortifiedUntilTurn: 19,
+        }),
+        P,
+      ),
+    );
   });
 
-  it('extracts at parity in the mid-game', () => {
-    assert.deepEqual(policy(state({})), { type: 'EXTRACT', amount: 10 });
+  it('fortifies when self < p1, including at the strict boundary', () => {
+    assert.deepEqual(policy(state({ selfBalance: '49', opponentBalance: '190' }), P), {
+      type: 'FORTIFY',
+    });
+    // self == p1 does NOT fortify (strict <).
+    assert.deepEqual(policy(state({ selfBalance: '50', opponentBalance: '150' }), P), {
+      type: 'EXTRACT',
+      amount: 5,
+    });
   });
 
-  it('fortifies a comfortable mid-game lead', () => {
-    assert.deepEqual(policy(state({ selfBalance: '120', opponentBalance: '100' })), {
+  it('fortify beats hold and the passive flag (highest precedence)', () => {
+    assert.deepEqual(policy(state({ selfBalance: '10', opponentBalance: '0' }), P), {
+      type: 'FORTIFY',
+    });
+    const passive = [5, 50, 100, 1, 0, 0, 0, 0];
+    assert.deepEqual(policy(state({ selfBalance: '10', opponentBalance: '190' }), passive), {
       type: 'FORTIFY',
     });
   });
 
-  it('fortifies any lead in the endgame, extracts when behind', () => {
-    assert.deepEqual(policy(state({ turn: 19, selfBalance: '101', opponentBalance: '100' })), {
+  it('holds when opp <= p2, extracts when opp > p2 (strict boundary)', () => {
+    assert.deepEqual(policy(state({ selfBalance: '100', opponentBalance: '100' }), P), {
+      type: 'HOLD',
+    });
+    assert.deepEqual(policy(state({ selfBalance: '100', opponentBalance: '101' }), P), {
+      type: 'EXTRACT',
+      amount: 5,
+    });
+  });
+
+  it('p3=1 replaces EXTRACT with HOLD but never overrides FORTIFY', () => {
+    const passive = [5, 50, 100, 1, 0, 0, 0, 0];
+    assert.deepEqual(policy(state({ selfBalance: '100', opponentBalance: '150' }), passive), {
+      type: 'HOLD',
+    });
+    assert.deepEqual(policy(state({ selfBalance: '10', opponentBalance: '150' }), passive), {
       type: 'FORTIFY',
     });
-    assert.deepEqual(policy(state({ turn: 19, selfBalance: '99', opponentBalance: '100' })), {
+  });
+
+  it('extracts exactly p0, uncapped by the opponent balance', () => {
+    assert.deepEqual(policy(state({ selfBalance: '100', opponentBalance: '1' }), [10, 0, 0, 0, 0, 0, 0, 0]), {
       type: 'EXTRACT',
       amount: 10,
     });
   });
 
-  it('extracts when nearly broke even with a lead', () => {
-    assert.deepEqual(policy(state({ selfBalance: '10', opponentBalance: '5', turn: 19 })), {
+  it('p1=0 disables FORTIFY entirely', () => {
+    assert.deepEqual(
+      policy(state({ selfBalance: '0', opponentBalance: '190' }), [10, 0, 0, 0, 0, 0, 0, 0]),
+      { type: 'EXTRACT', amount: 10 },
+    );
+  });
+
+  it('uses STRATEGY_PARAMS by default', () => {
+    const [p0] = STRATEGY_PARAMS;
+    assert.deepEqual(policy(state({ selfBalance: '100', opponentBalance: '100' })), {
       type: 'EXTRACT',
-      amount: 10,
+      amount: p0,
     });
+  });
+
+  it('rejects invalid params loudly (p0, p1, p2, p3, reserved)', () => {
+    assert.throws(() => policy(state({}), [0, 0, 0, 0, 0, 0, 0, 0]), /p0/);
+    assert.throws(() => policy(state({}), [11, 0, 0, 0, 0, 0, 0, 0]), /p0/);
+    assert.throws(() => policy(state({}), [5, 201, 0, 0, 0, 0, 0, 0]), /p1/);
+    assert.throws(() => policy(state({}), [5, 0, -1, 0, 0, 0, 0, 0]), /p2/);
+    assert.throws(() => policy(state({}), [5, 0, 0, 2, 0, 0, 0, 0]), /p3/);
+    assert.throws(() => policy(state({}), [5, 0, 0, 0, 1, 0, 0, 0]), /RESERVED/);
+    assert.throws(() => policy(state({}), [5, 0, 0, 0]), /exactly 8/);
+    assert.throws(() => policy(state({}), [5.5, 0, 0, 0, 0, 0, 0, 0]), /integer/);
   });
 
   it('safePolicy fails closed to HOLD on bad state', () => {
     assert.deepEqual(safePolicy({ selfBalance: 'NaN', opponentBalance: '1', turn: 0 }), {
       type: 'HOLD',
     });
+    assert.deepEqual(safePolicy({ selfBalance: '-5', opponentBalance: '1', turn: 0 }), {
+      type: 'HOLD',
+    });
   });
 
-  it('safePolicy clamps an out-of-range extract amount to HOLD', () => {
-    const badParams = { ...STRATEGY_PARAMS, EXTRACT_AMOUNT: 99 };
-    assert.deepEqual(safePolicy(state({}), badParams), { type: 'HOLD' });
+  it('safePolicy fails closed to HOLD on invalid params', () => {
+    assert.deepEqual(safePolicy(state({}), [0, 0, 0, 0, 0, 0, 0, 0]), { type: 'HOLD' });
+    assert.deepEqual(safePolicy(state({}), [5, 0, 0, 2, 0, 0, 0, 0]), { type: 'HOLD' });
+    assert.deepEqual(safePolicy(state({}), [5, 0, 0, 0, 0, 0, 0, 9]), { type: 'HOLD' });
   });
 });
 

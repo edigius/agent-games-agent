@@ -2,43 +2,43 @@
 /**
  * PEGASUS — strategy commitment helper.
  *
- * The platform requires a strategy COMMITMENT (a Poseidon hash of the
- * strategy params + salt) registered from the dashboard before Swiss
- * Round 1. This script exists to compute and print ONLY the hash — never
+ * The platform requires a strategy COMMITMENT registered from the
+ * dashboard (My Agents -> Edit agent -> Strategy Commitment) before
+ * Swiss Round 1. This script computes and prints ONLY the hash — never
  * the params, never the salt.
  *
- * BLOCKER: the Poseidon preimage layout is UNPUBLISHED. The docs say only
- * "a Poseidon hash of my strategy params + salt": no field order, no arity,
- * no encoding, no salt placement, and the circuit's parameter format is
- * unknown. Computing a hash from a guessed layout would register a
- * commitment the circuit can never match, silently breaking every turn
- * proof. This script therefore REFUSES to output a hash until the official
- * layout is known. When it is, implement computeCommitment() below, add a
- * test against an official worked example, and remove the refusal.
+ * The commitment formula is CONFIRMED by local fullProve+verify
+ * experiments against the vfy-policy circuit (15 Nov 2026):
+ *   commitment = Poseidon([strategyParams[0..7], salt])
+ * Poseidon arity 9, params first, salt LAST. The computation lives in
+ * the shared module src/commitment.js — the SAME code the proof adapter
+ * uses — so the registered hash always matches turn proofs by
+ * construction. Never duplicate the formula here.
  *
- * Usage (once implemented): STRATEGY_SALT=<secret> npm run commitment
+ * Usage: STRATEGY_SALT=<secret> npm run commitment
  * The salt must come from the environment only. It is never printed.
+ * The script refuses (non-zero exit) when STRATEGY_SALT is missing or
+ * invalid, or when the strategy params are invalid.
  */
 import { pathToFileURL } from 'node:url';
+import { computeCommitment, parseStrategySalt } from '../src/commitment.js';
 import { STRATEGY_PARAMS } from '../src/strategyParams.js';
 
-export function computeCommitment(_params, _salt) {
-  throw new Error(
-    'Commitment preimage layout is UNKNOWN: the official Poseidon input ' +
-      'order/encoding for strategy params + salt is unpublished. Refusing ' +
-      'to guess — a wrong commitment would invalidate every policy proof. ' +
-      'See scripts/commitment.js header and README "Known unknowns".',
-  );
-}
+// Re-exported so tests can verify the CLI and the proof adapter share
+// one implementation (same function object, same hash for same inputs).
+export { computeCommitment };
 
-function main() {
-  const salt = process.env.STRATEGY_SALT ?? '';
-  if (!salt) {
-    console.error('STRATEGY_SALT is not set. Set it as an environment variable; never commit it.');
+async function main() {
+  let salt;
+  try {
+    salt = parseStrategySalt(process.env.STRATEGY_SALT);
+  } catch (err) {
+    // parseStrategySalt messages never echo the value.
+    console.error(`commitment refused: ${err.message}`);
     process.exit(1);
   }
   try {
-    const hash = computeCommitment(STRATEGY_PARAMS, salt);
+    const hash = await computeCommitment(STRATEGY_PARAMS, salt);
     // ONLY the hash is ever printed.
     console.log(hash);
     process.exit(0);

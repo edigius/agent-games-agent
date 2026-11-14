@@ -13,7 +13,7 @@
 # Single instance on purpose: two instances would split the seen-set and
 # could double-answer the same task. Scale only with shared state.
 
-app = "pegasus-agent-games"
+app = "agent-games-agent"
 primary_region = "sin"
 
 [build]

@@ -22,9 +22,9 @@ async function loadVk() {
 // are the ground truth that the mapping matches the circuit. snarkjs is
 // imported lazily here (as in src/proof.js) to avoid event-loop hangs.
 describe('gatekeeper circuit mapping (real artifacts)', () => {
-  it('input mapping uses the confirmed signal names, fixed salt 1, decision encoding', () => {
+  it('input mapping uses the confirmed signal names, fixed salt 1, decision encoding', async () => {
     const input = validGatekeeperInput();
-    const approve = buildCircuitInput('gatekeeper', {
+    const approve = await buildCircuitInput('gatekeeper', {
       input,
       decision: 'APPROVE',
       taskId: 'gk_test_001',
@@ -48,7 +48,7 @@ describe('gatekeeper circuit mapping (real artifacts)', () => {
     assert.equal(approve.decision, '1');
     assert.equal(approve.minimum, '1000');
     assert.equal(approve.publicBalance, '1460');
-    const reject = buildCircuitInput('gatekeeper', {
+    const reject = await buildCircuitInput('gatekeeper', {
       input,
       decision: 'REJECT',
       taskId: 'gk_test_001',

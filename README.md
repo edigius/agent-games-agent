@@ -18,12 +18,10 @@ is no shortcut and none is attempted.
 
 PEGASUS is **pre-practice**: the transport, Gatekeeper decision logic,
 Gatekeeper proof generation (confirmed mapping, verified against the
-exported VK), signing, seen-set, Kurier client, and response shaping are
-built and tested. **Steal the VFY proof generation is still blocked**:
-the vfy-policy circuit mapping is unpublished and under separate
-discovery — Steal turns are answered correctly but WITHOUT policy-proof
-evidence until then. Do not enter scored rounds until practice mode
-passes, including the encoding validation in
+exported VK), Steal policy + proof generation (confirmed vfy-policy
+mapping, verified against the exported VK), signing, seen-set, Kurier
+client, and response shaping are built and tested. Do not enter scored
+rounds until practice mode passes, including the encoding validation in
 [Known unknowns](#known-unknowns).
 
 ## How it works
@@ -84,12 +82,38 @@ must live on the persistent volume (see `fly.toml`).
 
 ### Steal the VFY
 
-The policy is a pure function of the envelope state
-(`selfBalance`, `opponentBalance`, `turn`, fortify flags) and the
-parameters in `src/strategyParams.js` — the ONLY file strategy values
-live in. Current values are **PROVISIONAL** (starting point for the
-simulator, not a tuned strategy) and must not be committed to the
-platform until the circuit's parameter format is known.
+The policy is the EXACT rule enforced by the vfy-policy circuit
+(confirmed by local fullProve+verify experiments, 15 Nov 2026),
+parameterized by the 8 values in `src/strategyParams.js` — the ONLY file
+strategy values live in. In precedence order:
+
+```
+if selfBalance < p1:          FORTIFY, amount 0
+elif opponentBalance <= p2:   HOLD, amount 0
+elif p3 == 1:                 HOLD, amount 0
+else:                         EXTRACT, amount p0
+```
+
+Only 4 knobs are live: p0 = EXTRACT amount (1..10), p1 = FORTIFY
+threshold on own balance (0 disables), p2 = HOLD threshold on opponent
+balance, p3 = passive flag {0,1}; p4..p7 are reserved and must be 0.
+Boundaries are strict as written. Turn number and fortification state
+do NOT affect the policy — the circuit's policy cannot see them. The
+committed values were chosen ONLY by the staged simulator search (see
+[Simulator](#simulator)); the search evidence is cited in
+`src/strategyParams.js`.
+
+The strategy commitment is `Poseidon([p0..p7, salt])`, arity 9, salt
+last — computed by the shared module `src/commitment.js`, used by both
+the proof adapter and the commitment CLI, so turn proofs always match
+the registered hash by construction. The turn proof's public signals
+are `[bindingHash, commitment, matchId, turnNumber, selfBalance,
+opponentBalance, action, amount, circuitVersion]` with
+`bindingHash = Poseidon([matchId, turnNumber, circuitVersion])`; salt
+and params stay private. If proof generation fails for a turn (e.g.
+the circuit rejects a fail-closed HOLD, or the salt/params do not match
+the registered commitment), the server degrades to a proof-less turn
+response and logs loudly — evidence is never faked.
 
 `publicInputsHash` is keccak256 over 8 ABI-packed 32-byte big-endian
 fields in the published order: commitment, matchId, turn, selfBalance,
@@ -129,9 +153,9 @@ Environment variables (see `.env.example`):
 | Variable | Required | Notes |
 |---|---|---|
 | `AGENT_GAMES_HMAC_SECRET` | yes | From dashboard "Rotate Secret", revealed once |
+| `STRATEGY_SALT` | yes | Self-generated secret; server fails fast without it; same salt must be used for the commitment CLI |
 | `KURIER_API_KEY` | no* | From https://kurier.xyz signup |
 | `KURIER_API_URL` | no | Defaults to mainnet |
-| `STRATEGY_SALT` | CLI only | For `npm run commitment` |
 | `PORT` | no | Default 8080 |
 | `SEEN_SET_PATH` | no | Default `data/seen-set.json` |
 
@@ -143,7 +167,7 @@ submitted to zkVerify and `proofReference` stays null.
 ```sh
 fly launch --no-deploy          # pick a globally unique app name
 fly volumes create pegasus_data --size 1 --region sin
-fly secrets set AGENT_GAMES_HMAC_SECRET="..." KURIER_API_KEY="..."
+fly secrets set AGENT_GAMES_HMAC_SECRET="..." STRATEGY_SALT="..." KURIER_API_KEY="..."
 fly deploy
 ```
 
@@ -161,14 +185,18 @@ Single instance on purpose: two instances would split the seen-set.
 
 ```sh
 npm run simulate [matches] [seed]   # default 1000 matches, seed 20261115
+node scripts/simulate.js --search [seed]   # staged parameter search
 ```
 
 Plays the current policy against always-EXTRACT-10, always-FORTIFY,
 always-HOLD, seeded-random, and tit-for-tat opponents, and reports
 win/draw/loss plus average balances. Resolver assumptions are documented
-in the script header. The harness validates; it does not tune — strategy
-changes go in `src/strategyParams.js` only, and are re-simulated before
-any commitment.
+in the script header. `--search` runs the staged search (coarse grid,
+refine around the best, high-match verification) and reports the
+winning params — the ONLY sanctioned source of tuned values for
+`src/strategyParams.js`. Strategy changes go in `src/strategyParams.js`
+only, are re-simulated before any commitment, and the commitment must
+be re-registered whenever the params change.
 
 ## Commitment CLI
 
@@ -176,12 +204,13 @@ any commitment.
 STRATEGY_SALT="..." npm run commitment
 ```
 
-Currently REFUSES to output a hash: the Poseidon preimage layout is
-unpublished, and a guessed commitment would invalidate every policy
-proof. When the official layout is known, implement
-`computeCommitment()` in `scripts/commitment.js` and test it against an
-official worked example. The CLI prints only the hash — never params,
-never salt.
+Prints ONLY the strategy commitment hash
+(`Poseidon([p0..p7, salt])`), computed by the shared module
+`src/commitment.js` — the same code the proof adapter uses. Register
+the printed hash on the dashboard (My Agents → Edit agent → Strategy
+Commitment) before Swiss Round 1, using the SAME salt the server runs
+with. The CLI refuses (non-zero exit) when `STRATEGY_SALT` is missing
+or invalid. It never prints params or salt.
 
 ## Known unknowns (practice-validation items)
 
@@ -198,42 +227,38 @@ play. Nothing here is invented.
    the BN128 modulus, else keccak256-mod-modulus; non-numeric task ids
    hashed as UTF-8). Practice-mode teaching feedback must confirm them;
    if they differ, change ONLY `toField()`.
-2. **Vfy-policy circuit mapping (BLOCKER for Steal proofs).** Signal
-   names/order and the strategy-parameter format are unpublished;
-   discovery is running separately. `src/proof.js` throws for
-   `vfyPolicy` and Steal turns degrade to proof-less responses until it
-   is implemented. Do not guess.
-3. **Commitment preimage (BLOCKER for Steal).** "Poseidon hash of params
-   + salt" with no field order, arity, encoding, or salt placement, and
-   no published parameter format. `scripts/commitment.js` refuses.
-4. **Reason-code mapping for 3 traps.** The canonical list has no
+2. **Reason-code mapping for 3 traps.** The canonical list has no
    expiry/recipient/overflow code. Provisional mapping (all three →
    `PUBLIC_INPUT_MISMATCH`) lives in `src/reasonCodes.js`; practice mode
    must confirm whether the platform expects the canonical codes or the
    event-page trap names (`EXPIRED_CONDITION`, `RECIPIENT_MISMATCH`,
    `AMOUNT_OVERFLOW`).
-5. **Finalized vs 60 seconds.** Docs demand Finalized "before approval"
+3. **Finalized vs 60 seconds.** Docs demand Finalized "before approval"
    but also a hard 60s response deadline, with no published finalization
    time. PEGASUS never blocks on Finalized; practice (which uses a
    TIGHTER deadline than competition) must confirm the platform accepts
    proof evidence in the response without waiting. Proof generation
    measured ~1s locally, so the response path stays fast.
-6. **Response superset.** The `/build` JSON examples show fewer fields
+4. **Response superset.** The `/build` JSON examples show fewer fields
    than the prose/guide require. PEGASUS sends the union
    (`decision`/`reason_code`/`proof_tx`/`proof`/`public_signals`;
    Steal adds `proof`/`public_signals` beside `policyProof`), except
    replay tasks, which carry no proof fields by design. Practice must
    confirm extra fields are accepted.
-7. **HMAC header encoding.** Docs say HMAC-SHA256 over the raw body
+5. **HMAC header encoding.** Docs say HMAC-SHA256 over the raw body
    without naming the encoding. PEGASUS emits lowercase hex and accepts
    hex or base64 inbound. Practice/preflight confirms.
-8. **Incoming-proof verification.** No lookup API is published; PEGASUS
+6. **Incoming-proof verification.** No lookup API is published; PEGASUS
    does not attempt one. If practice reveals an expected check, add it
    in `src/gatekeeper.js` behind the same fail-closed discipline.
-9. **Steal turn numbering and fortify duration.** Whether turns are
+7. **Steal turn numbering and fortify duration.** Whether turns are
    0- or 1-based, and whether fortification lasts one turn or until
-   `fortifiedUntilTurn`, is unstated. The policy/simulator assume the
-   conservative readings documented in code; practice matches confirm.
+   `fortifiedUntilTurn`, is unstated. Turn numbering no longer affects
+   the policy (the circuit ignores it; the turn value is passed through
+   into the binding hash and `publicInputsHash` exactly as received),
+   but fortify duration still affects the SIMULATOR's resolver
+   assumptions (one turn, per the script header). Practice matches
+   confirm.
 
 ## Rules compliance
 
@@ -257,14 +282,19 @@ src/
   gatekeeper.js     pure decision logic
   reasonCodes.js    canonical codes + provisional trap mapping
   seenSet.js        persistent replay memory (atomic JSON file)
-  steal.js          policy, publicInputsHash, response shaping
-  strategyParams.js PROVISIONAL strategy values (single source)
-  proof.js          snarkjs adapter + Kurier orchestration (gatekeeper
-                    mapping confirmed; vfyPolicy stubbed, discovery pending)
+  steal.js          policy (confirmed circuit rule), publicInputsHash,
+                    response shaping
+  strategyParams.js strategy values (single source) + validator
+  commitment.js     shared Poseidon commitment + binding hash (used by
+                    proof adapter and commitment CLI alike)
+  proof.js          snarkjs adapter + Kurier orchestration (both circuit
+                    mappings confirmed; public-signal echo assertions)
   kurier.js         Kurier REST client (one submit, polled reads)
 scripts/
-  commitment.js     commitment CLI (refuses until layout is known)
-  simulate.js       Steal match simulator + opponent battery
-test/               node:test suite (no network, mocked proof/Kurier)
+  commitment.js     commitment CLI (prints only the hash)
+  simulate.js       Steal match simulator + opponent battery + staged
+                    parameter search (--search)
+test/               node:test suite (no network, mocked proof/Kurier,
+                    plus real-artifact circuit suites)
 circuits/           downloaded artifacts (wasm, zkey, exported vk)
 ```

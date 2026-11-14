@@ -1,12 +1,16 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server.js';
 import { SeenSet } from '../src/seenSet.js';
 import { SIGNATURE_HEADER, signBody, verifySignature } from '../src/hmac.js';
+import { computeCommitment } from '../src/commitment.js';
+import { safePolicy } from '../src/steal.js';
+import { STRATEGY_PARAMS } from '../src/strategyParams.js';
 import { gatekeeperEnvelope, stealEnvelope, VK_B, validGatekeeperInput } from './helpers.js';
 
 const SECRET = 'test-only-server-secret';
@@ -26,11 +30,15 @@ const MOCK_EVIDENCE = {
 // short-circuit never attempts proof generation.
 const proofCalls = [];
 
-function post(path, bodyObj, { sign = true, secret = SECRET, rawBody = null } = {}) {
+function post(
+  path,
+  bodyObj,
+  { sign = true, secret = SECRET, rawBody = null, targetPort = port } = {},
+) {
   return new Promise((resolve, reject) => {
     const body = rawBody ?? Buffer.from(JSON.stringify(bodyObj));
     const req = request(
-      { host: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
+      { host: '127.0.0.1', port: targetPort, path, method: 'POST', headers: { 'content-type': 'application/json' } },
       (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -205,16 +213,94 @@ describe('server: steal end-to-end (mock proof provider)', () => {
     assert.equal(verifySignature(SECRET, res.raw, res.headers[SIGNATURE_HEADER]), true);
   });
 
-  it('omits amount when the policy fortifies (comfortable lead)', async () => {
-    const envelope = stealEnvelope({ selfBalance: '130', opponentBalance: '100' });
-    const res = await post('/agent', envelope);
-    assert.equal(res.json.action.type, 'FORTIFY');
-    assert.equal('amount' in res.json.action, false);
+  it('turn action matches the policy module and amount shaping follows the action', async () => {
+    const states = [
+      { selfBalance: '95', opponentBalance: '105' },
+      { selfBalance: '10', opponentBalance: '190' },
+      { selfBalance: '100', opponentBalance: '0' },
+    ];
+    for (const [i, s] of states.entries()) {
+      const envelope = stealEnvelope(s, { turn: 10 + i });
+      const res = await post('/agent', envelope);
+      assert.equal(res.status, 200);
+      const expected = safePolicy({ ...s, turn: 10 + i });
+      assert.equal(res.json.action.type, expected.type);
+      if (expected.type === 'EXTRACT') {
+        assert.equal(res.json.action.amount, expected.amount);
+      } else {
+        // HOLD/FORTIFY omit amount entirely.
+        assert.equal('amount' in res.json.action, false);
+      }
+    }
   });
 
   it('produces distinct idempotency keys per turn', async () => {
     const a = await post('/agent', stealEnvelope({}, { turn: 4 }));
     const b = await post('/agent', stealEnvelope({}, { turn: 5 }));
     assert.notEqual(a.json.idempotencyKey, b.json.idempotencyKey);
+  });
+});
+
+describe('server: steal end-to-end (REAL proof provider, real artifacts)', () => {
+  const TEST_SALT = 777n;
+  let realServer;
+  let realPort;
+  let realTmpDir;
+
+  before(async () => {
+    realTmpDir = await mkdtemp(join(tmpdir(), 'pegasus-server-real-'));
+    const seenSet = new SeenSet(join(realTmpDir, 'seen-set.json'));
+    await seenSet.load();
+    realServer = createServer({
+      config: { hmacSecret: SECRET, strategySalt: TEST_SALT, hasKurierKey: false },
+      seenSet,
+      kurier: null,
+      // No mock proofProvider: defaultProofProvider generates a real proof.
+    });
+    await new Promise((resolve) => realServer.listen(0, '127.0.0.1', resolve));
+    realPort = realServer.address().port;
+  });
+
+  after(async () => {
+    realServer.closeAllConnections();
+    await new Promise((resolve) => realServer.close(resolve));
+    await rm(realTmpDir, { recursive: true, force: true });
+  });
+
+  it('returns a turn whose proof verifies against the exported VK', async () => {
+    const hash = await computeCommitment(STRATEGY_PARAMS, TEST_SALT);
+    const envelope = stealEnvelope(
+      { selfBalance: '100', opponentBalance: '100' },
+      { turn: 1, strategyCommitment: { hash } },
+    );
+    const res = await post('/agent', envelope, { targetPort: realPort });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.matchId, envelope.matchId);
+    assert.ok(res.json.proof, 'proof evidence present');
+    assert.equal(res.json.public_signals.length, 9);
+    assert.equal(verifySignature(SECRET, res.raw, res.headers[SIGNATURE_HEADER]), true);
+
+    const snarkjs = await import('snarkjs');
+    const vk = JSON.parse(
+      await readFile(
+        join(dirname(fileURLToPath(import.meta.url)), '..', 'circuits/vfyPolicy.vk.json'),
+        'utf8',
+      ),
+    );
+    assert.equal(
+      await snarkjs.groth16.verify(vk, res.json.public_signals, res.json.proof),
+      true,
+    );
+  });
+
+  it('degrades to a proof-less but valid turn when the commitment mismatches', async () => {
+    const envelope = stealEnvelope({}, { strategyCommitment: { hash: '999' } });
+    const res = await post('/agent', envelope, { targetPort: realPort });
+    assert.equal(res.status, 200);
+    assert.equal('proof' in res.json, false);
+    assert.equal('public_signals' in res.json, false);
+    // The policy still answers; only the evidence is withheld.
+    assert.equal(res.json.action.type, safePolicy(envelope.state).type);
+    assert.equal(verifySignature(SECRET, res.raw, res.headers[SIGNATURE_HEADER]), true);
   });
 });
