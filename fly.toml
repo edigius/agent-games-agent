@@ -1,40 +1,30 @@
-# PEGASUS on Fly.io
+# fly.toml app configuration file generated for agent-games-agent-zlqxcw on 2026-11-14T19:57:38Z
 #
-# Deploy (from the repo root, with flyctl authenticated):
-#   fly launch --no-deploy          # pick a globally unique app name
-#   fly volumes create pegasus_data --size 1 --region sin
-#   fly secrets set AGENT_GAMES_HMAC_SECRET="..." KURIER_API_KEY="..."
-#   fly deploy
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
 #
-# The persistent volume is REQUIRED: the Gatekeeper seen-set (replay
-# detection) lives in /data/seen-set.json and must survive redeploys. A
-# deploy without the volume silently resets replay memory.
-#
-# Single instance on purpose: two instances would split the seen-set and
-# could double-answer the same task. Scale only with shared state.
 
-app = "agent-games-agent"
-primary_region = "sin"
+app = 'agent-games-agent-zlqxcw'
+primary_region = 'sin'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
-  SEEN_SET_PATH = "/data/seen-set.json"
+  PORT = '8080'
+  SEEN_SET_PATH = '/data/seen-set.json'
+
+[[mounts]]
+  source = 'pegasus_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
-  processes = ["app"]
+  processes = ['app']
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "1gb"
-
-[[mounts]]
-  source = "pegasus_data"
-  destination = "/data"
+  size = 'shared-cpu-1x'
+  memory = '1gb'
