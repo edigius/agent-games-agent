@@ -1,0 +1,10 @@
+.env
+node_modules/
+data/
+seen-set.json
+*.log
+.DS_Store
+# Circuit binaries are downloaded + hash-verified at Docker build time,
+# never committed. The exported verification keys (*.vk.json) ARE committed.
+circuits/*.wasm
+circuits/*_final.zkey
