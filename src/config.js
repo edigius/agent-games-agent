@@ -18,6 +18,11 @@ export const VK_HASH = Object.freeze({
 
 export const CIRCUIT_VERSION = 'v1';
 
+// Build marker, reported by GET /health so a deployment can be verified
+// as the intended code. BUMP ON EVERY PUSH (monotonic label is enough;
+// the value is only ever compared for equality across deploys).
+export const BUILD_ID = 'bg-submit-1';
+
 // Verified circuit facts (snarkjs export, 15 Nov 2026). nPublic is known;
 // signal names/order are NOT published — see src/proof.js.
 export const CIRCUIT = Object.freeze({

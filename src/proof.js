@@ -362,22 +362,26 @@ export async function generateProof(circuit, data) {
 
 /**
  * Full evidence pipeline for one task/turn:
- *   generate proof -> submit to Kurier (one attempt) -> return immediately.
- * Finalization polling runs in the BACKGROUND (fire-and-forget, capped,
- * logging only) and NEVER holds the response: awaiting it burned the whole
- * deadline budget, so the server watchdog answered fail-closed
- * (MISSING_VERIFICATION, no proof fields) — observed on practice task
- * practice_b6662f40, 15 Nov 2026, where the 15s practice deadline left a
- * ~9s budget and the poll consumed all of it. The proof and public
- * signals ride in the response itself so the platform can verify
- * independently.
+ *   generate proof -> return immediately.
+ * Kurier submission AND finalization polling run in the BACKGROUND
+ * (fire-and-forget, capped, logging only) and NEVER hold the response:
+ * awaiting finalization burned the whole deadline budget on practice
+ * task practice_b6662f40 (watchdog answered fail-closed), and awaiting
+ * the submit itself left the same ~9s signature on practice task
+ * practice_502f0b25 after the poll-only fix — the response path must
+ * not depend on any network round-trip. The proof and public signals
+ * ride in the response itself so the platform can verify independently,
+ * and the background submission still lands the on-chain attestation
+ * (practice task 1 proved late on-chain arrival still yields VERIFIED).
  * @param {object} opts - { circuit, data, kurier: KurierClient|null,
- *   deadlineMs, onEvent, finalizeBudgetMs }
+ *   deadlineMs, onEvent, submitTimeoutMs, finalizeBudgetMs }
  * @returns {{proof, publicSignals, proofReference, kurierStatus,
- *   kurierFinalized}} — kurierFinalized is always false at return time:
- *   finalization is reported later via onEvent ('kurier_finalized').
+ *   kurierFinalized}} — proofReference/kurierStatus are always null at
+ *   return time (submission pending); kurierFinalized is always false.
+ *   Submission/finalization are reported later via onEvent
+ *   ('kurier_submitted', 'kurier_finalized', 'kurier_failed').
  * @throws when proof generation fails (witness rejection, bad input).
- *   Kurier failures never throw: the proof still rides in the response.
+ *   Kurier failures never throw and never surface synchronously.
  */
 export async function proveAndSubmit({
   circuit,
@@ -385,60 +389,59 @@ export async function proveAndSubmit({
   kurier = null,
   deadlineMs,
   onEvent = null,
+  submitTimeoutMs = 20_000,
   finalizeBudgetMs = 180_000,
 }) {
-  const started = Date.now();
-  const remaining = () => Math.max(0, deadlineMs - (Date.now() - started));
-
   const { proof, publicSignals } = await generateProof(circuit, data);
   if (onEvent) onEvent('proof_generated', { circuit });
 
-  let proofReference = null;
-  let kurierStatus = null;
-  const kurierFinalized = false;
-
   if (kurier instanceof KurierClient) {
-    try {
-      const job = await kurier.submitProof({
-        proof,
-        publicSignals,
-        vkHash: CIRCUIT[circuit].vkHash,
-        timeoutMs: Math.min(20_000, remaining()),
-      });
-      proofReference = job?.jobId ?? null;
-      kurierStatus = job?.status ?? 'Submitted';
-      if (onEvent) onEvent('kurier_submitted', { jobId: proofReference });
-      if (proofReference) {
-        // Background finalization watch: NEVER awaited. Reports via
-        // onEvent for logging only; all errors are swallowed here.
-        void kurier
-          .waitForFinalized(proofReference, {
+    // Background submission + finalization watch: NEVER awaited. All
+    // outcomes report via onEvent for logging only; all errors are
+    // swallowed here so the background chain can never crash the server.
+    void (async () => {
+      try {
+        const job = await kurier.submitProof({
+          proof,
+          publicSignals,
+          vkHash: CIRCUIT[circuit].vkHash,
+          timeoutMs: submitTimeoutMs,
+        });
+        const jobId = job?.jobId ?? null;
+        if (onEvent) {
+          onEvent('kurier_submitted', {
+            jobId,
+            status: job?.status ?? 'Submitted',
+          });
+        }
+        if (jobId) {
+          const waited = await kurier.waitForFinalized(jobId, {
             deadlineMs: finalizeBudgetMs,
             onStatus: (status) => {
               if (onEvent) onEvent('kurier_status', { status });
             },
-          })
-          .then((waited) => {
-            if (onEvent) {
-              onEvent('kurier_finalized', {
-                jobId: proofReference,
-                finalized: waited.finalized,
-                status: waited.status,
-              });
-            }
-          })
-          .catch((err) => {
-            if (onEvent) onEvent('kurier_poll_error', { error: err.message });
           });
+          if (onEvent) {
+            onEvent('kurier_finalized', {
+              jobId,
+              finalized: waited.finalized,
+              status: waited.status,
+            });
+          }
+        }
+      } catch (err) {
+        if (onEvent) onEvent('kurier_failed', { error: err.message });
       }
-    } catch (err) {
-      // Kurier failure must never lose the decision: the proof still rides
-      // in the response for independent platform verification.
-      if (onEvent) onEvent('kurier_failed', { error: err.message });
-    }
+    })();
   }
 
-  return { proof, publicSignals, proofReference, kurierStatus, kurierFinalized };
+  return {
+    proof,
+    publicSignals,
+    proofReference: null,
+    kurierStatus: null,
+    kurierFinalized: false,
+  };
 }
 
 /**

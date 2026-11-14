@@ -290,18 +290,70 @@ describe('proveAndSubmit: never waits for Finalized (practice_b6662f40 regressio
       onEvent: (event, fields) => events.push([event, fields]),
     });
     const elapsed = Date.now() - started;
-    // The old code awaited finalization and burned the whole 30s budget;
-    // the fixed code returns after prove + submit (a few seconds at most).
+    // The old code awaited submit + finalization and burned the whole 30s
+    // budget; the fixed code returns after proving (a few seconds at most)
+    // with the submission still pending in the background.
     assert.ok(elapsed < 10_000, `returned in ${elapsed}ms, must not wait out the budget`);
     assert.ok(result.proof, 'proof rides in the result');
-    assert.equal(result.proofReference, 'job-1');
+    assert.equal(result.proofReference, null);
+    assert.equal(result.kurierStatus, null);
     assert.equal(result.kurierFinalized, false);
-    assert.ok(events.some(([e]) => e === 'kurier_submitted'));
-    // The background poll still reports (without blocking): give it a
-    // moment past its 200ms budget, then confirm the report arrived.
+    // The background chain still reports (without blocking): give it a
+    // moment past its 200ms poll budget, then confirm the reports arrived.
     await new Promise((resolve) => setTimeout(resolve, 400));
+    const submitted = events.find(([e]) => e === 'kurier_submitted');
+    assert.ok(submitted, 'background submit reported');
+    assert.equal(submitted[1].jobId, 'job-1');
     const fin = events.find(([e]) => e === 'kurier_finalized');
     assert.ok(fin, 'background poll reported finalization outcome');
     assert.equal(fin[1].finalized, false);
+  });
+
+  it('returns even when the Kurier submit itself never answers (practice_502f0b25)', async () => {
+    const events = [];
+    const client = new KurierClient({
+      apiUrl: 'https://api.kurier.xyz/api/v1',
+      apiKey: 'test-key',
+      pollIntervalMs: 5,
+      fetchImpl: async (_url, opts) => {
+        // Hang until the client's abort signal fires, like a stalled API.
+        await new Promise((_resolve, reject) => {
+          opts.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+        throw new Error('unreachable');
+      },
+    });
+    const input = {
+      registered_vk: '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0',
+      minimum: '1000',
+      public_balance: '1460',
+      expiry_block: 8430000,
+      current_block: 8420000,
+      recipient: '0xabcdef1234567890abcdef1234567890abcdef12',
+      condition_recipient: '0xabcdef1234567890abcdef1234567890abcdef12',
+      amount: '1800',
+      max_transfer: '1000',
+      proof_tx: '0xb6662f404bd7442a804fd211ca96dfd4',
+      proof_vk: '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0',
+    };
+    const started = Date.now();
+    const result = await proveAndSubmit({
+      circuit: 'gatekeeper',
+      data: {
+        input,
+        decision: 'REJECT',
+        taskId: 'practice_502f0b25-slow-submit',
+      },
+      kurier: client,
+      deadlineMs: 30_000,
+      submitTimeoutMs: 150,
+      finalizeBudgetMs: 200,
+      onEvent: (event, fields) => events.push([event, fields]),
+    });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 10_000, `returned in ${elapsed}ms despite a stalled submit`);
+    assert.ok(result.proof, 'proof rides in the result');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.ok(events.some(([e]) => e === 'kurier_failed'), 'stalled submit reported as failed');
   });
 });

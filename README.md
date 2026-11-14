@@ -130,13 +130,15 @@ via Kurier REST (`POST /submit-proof/{key}`, poll `GET /job-status/`
 to Finalized). The `.wasm`/`.zkey` binaries are not committed to the repo;
 the Dockerfile downloads them from the official Agent Games site at build
 time and verifies their SHA256 hashes (see `Dockerfile`). For local runs,
-place the four artifacts in `circuits/` (URLs: `/api/circuit-info`). The response is NEVER held waiting for Finalized: the
+place the four artifacts in `circuits/` (URLs: `/api/circuit-info`). The response is NEVER held waiting for Kurier at all: the
 proof and public signals ride in the response itself so the platform can
-verify independently, and Kurier finalization polling continues in the
-background after the response (never on the response path: awaiting it
-burned the whole deadline budget on practice task practice_b6662f40).
-Exactly one Kurier submission is attempted per
-task/turn; only idempotent status polls are retried.
+verify independently, and the Kurier submission + finalization polling
+run in the background after the response (awaiting either one burned
+the whole deadline budget on practice tasks practice_b6662f40 and
+practice_502f0b25). Exactly one Kurier submission is attempted per
+task/turn; only idempotent status polls are retried. GET /health reports
+a buildId (bumped in src/config.js on every push) so a deployment can be
+verified as the intended code.
 
 ## Setup
 

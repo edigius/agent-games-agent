@@ -18,6 +18,7 @@
 import { createServer as createHttpServer } from 'node:http';
 import { existsSync } from 'node:fs';
 import {
+  BUILD_ID,
   CIRCUIT,
   GATEKEEPER_DEADLINE_MS,
   GATEKEEPER_MARGIN_MS,
@@ -387,6 +388,7 @@ export function createServer({
     return {
       status: degraded ? 'degraded' : 'ok',
       name: 'PEGASUS',
+      buildId: BUILD_ID,
       uptimeMs: Date.now() - STARTED_AT,
       hmacConfigured: Boolean(config.hmacSecret),
       strategySaltConfigured: typeof config.strategySalt === 'bigint',
