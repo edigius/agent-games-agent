@@ -132,8 +132,10 @@ the Dockerfile downloads them from the official Agent Games site at build
 time and verifies their SHA256 hashes (see `Dockerfile`). For local runs,
 place the four artifacts in `circuits/` (URLs: `/api/circuit-info`). The response is NEVER held waiting for Finalized: the
 proof and public signals ride in the response itself so the platform can
-verify independently, and Kurier polling is opportunistic inside the
-remaining deadline budget. Exactly one Kurier submission is attempted per
+verify independently, and Kurier finalization polling continues in the
+background after the response (never on the response path: awaiting it
+burned the whole deadline budget on practice task practice_b6662f40).
+Exactly one Kurier submission is attempted per
 task/turn; only idempotent status polls are retried.
 
 ## Setup

@@ -362,12 +362,20 @@ export async function generateProof(circuit, data) {
 
 /**
  * Full evidence pipeline for one task/turn:
- *   generate proof -> submit to Kurier (one attempt) -> poll opportunistically
- *   inside the remaining budget.
+ *   generate proof -> submit to Kurier (one attempt) -> return immediately.
+ * Finalization polling runs in the BACKGROUND (fire-and-forget, capped,
+ * logging only) and NEVER holds the response: awaiting it burned the whole
+ * deadline budget, so the server watchdog answered fail-closed
+ * (MISSING_VERIFICATION, no proof fields) — observed on practice task
+ * practice_b6662f40, 15 Nov 2026, where the 15s practice deadline left a
+ * ~9s budget and the poll consumed all of it. The proof and public
+ * signals ride in the response itself so the platform can verify
+ * independently.
  * @param {object} opts - { circuit, data, kurier: KurierClient|null,
- *   deadlineMs, onEvent }
+ *   deadlineMs, onEvent, finalizeBudgetMs }
  * @returns {{proof, publicSignals, proofReference, kurierStatus,
- *   kurierFinalized}}
+ *   kurierFinalized}} — kurierFinalized is always false at return time:
+ *   finalization is reported later via onEvent ('kurier_finalized').
  * @throws when proof generation fails (witness rejection, bad input).
  *   Kurier failures never throw: the proof still rides in the response.
  */
@@ -377,6 +385,7 @@ export async function proveAndSubmit({
   kurier = null,
   deadlineMs,
   onEvent = null,
+  finalizeBudgetMs = 180_000,
 }) {
   const started = Date.now();
   const remaining = () => Math.max(0, deadlineMs - (Date.now() - started));
@@ -386,7 +395,7 @@ export async function proveAndSubmit({
 
   let proofReference = null;
   let kurierStatus = null;
-  let kurierFinalized = false;
+  const kurierFinalized = false;
 
   if (kurier instanceof KurierClient) {
     try {
@@ -399,16 +408,28 @@ export async function proveAndSubmit({
       proofReference = job?.jobId ?? null;
       kurierStatus = job?.status ?? 'Submitted';
       if (onEvent) onEvent('kurier_submitted', { jobId: proofReference });
-      if (proofReference && remaining() > 0) {
-        const waited = await kurier.waitForFinalized(proofReference, {
-          deadlineMs: remaining(),
-          onStatus: (status) => {
-            kurierStatus = status;
-            if (onEvent) onEvent('kurier_status', { status });
-          },
-        });
-        kurierFinalized = waited.finalized;
-        kurierStatus = waited.status ?? kurierStatus;
+      if (proofReference) {
+        // Background finalization watch: NEVER awaited. Reports via
+        // onEvent for logging only; all errors are swallowed here.
+        void kurier
+          .waitForFinalized(proofReference, {
+            deadlineMs: finalizeBudgetMs,
+            onStatus: (status) => {
+              if (onEvent) onEvent('kurier_status', { status });
+            },
+          })
+          .then((waited) => {
+            if (onEvent) {
+              onEvent('kurier_finalized', {
+                jobId: proofReference,
+                finalized: waited.finalized,
+                status: waited.status,
+              });
+            }
+          })
+          .catch((err) => {
+            if (onEvent) onEvent('kurier_poll_error', { error: err.message });
+          });
       }
     } catch (err) {
       // Kurier failure must never lose the decision: the proof still rides

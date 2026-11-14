@@ -239,3 +239,69 @@ describe('kurier client (mocked transport, no real network)', () => {
     assert.equal(calls, 3);
   });
 });
+
+describe('proveAndSubmit: never waits for Finalized (practice_b6662f40 regression)', () => {
+  it('returns right after submit even when finalization never arrives', async () => {
+    const events = [];
+    const client = new KurierClient({
+      apiUrl: 'https://api.kurier.xyz/api/v1',
+      apiKey: 'test-key',
+      pollIntervalMs: 5,
+      fetchImpl: async (url) => {
+        if (url.includes('/submit-proof/')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ jobId: 'job-1', status: 'Queued' }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'Queued', jobId: 'job-1' }),
+        };
+      },
+    });
+    // Exact input of practice task practice_b6662f40 (AMOUNT_OVERFLOW).
+    const input = {
+      registered_vk: '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0',
+      minimum: '1000',
+      public_balance: '1460',
+      expiry_block: 8430000,
+      current_block: 8420000,
+      recipient: '0xabcdef1234567890abcdef1234567890abcdef12',
+      condition_recipient: '0xabcdef1234567890abcdef1234567890abcdef12',
+      amount: '1800',
+      max_transfer: '1000',
+      proof_tx: '0xb6662f404bd7442a804fd211ca96dfd4',
+      proof_vk: '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0',
+    };
+    const started = Date.now();
+    const result = await proveAndSubmit({
+      circuit: 'gatekeeper',
+      data: {
+        input,
+        decision: 'REJECT',
+        taskId: 'practice_b6662f40-4bd7-442a-804f-d211ca96dfd4',
+      },
+      kurier: client,
+      deadlineMs: 30_000,
+      finalizeBudgetMs: 200,
+      onEvent: (event, fields) => events.push([event, fields]),
+    });
+    const elapsed = Date.now() - started;
+    // The old code awaited finalization and burned the whole 30s budget;
+    // the fixed code returns after prove + submit (a few seconds at most).
+    assert.ok(elapsed < 10_000, `returned in ${elapsed}ms, must not wait out the budget`);
+    assert.ok(result.proof, 'proof rides in the result');
+    assert.equal(result.proofReference, 'job-1');
+    assert.equal(result.kurierFinalized, false);
+    assert.ok(events.some(([e]) => e === 'kurier_submitted'));
+    // The background poll still reports (without blocking): give it a
+    // moment past its 200ms budget, then confirm the report arrived.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const fin = events.find(([e]) => e === 'kurier_finalized');
+    assert.ok(fin, 'background poll reported finalization outcome');
+    assert.equal(fin[1].finalized, false);
+  });
+});
