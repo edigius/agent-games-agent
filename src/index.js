@@ -9,6 +9,7 @@ import { STRATEGY_PARAMS, validateStrategyParams } from './strategyParams.js';
 import { SeenSet } from './seenSet.js';
 import { KurierClient } from './kurier.js';
 import { createServer } from './server.js';
+import { runWarmup } from './warmup.js';
 
 function log(event, fields = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...fields }));
@@ -36,22 +37,27 @@ async function main() {
     });
   }
 
-  const server = createServer({ config, seenSet, kurier });
+  // Full startup warm-up BEFORE listening (see src/warmup.js): snarkjs
+  // import, artifact + VK checks, and one dummy REJECT proof that must
+  // verify. A failure logs loudly but never blocks boot; Fly's
+  // health-check grace period covers the warm-up time.
+  const warmup = await runWarmup({ log });
+  log('warmup', {
+    ok: warmup.ok,
+    durationMs: warmup.durationMs,
+    ...(warmup.error ? { error: warmup.error } : {}),
+  });
+
+  const server = createServer({ config, seenSet, kurier, warmupOk: warmup.ok });
   await new Promise((resolve) => server.listen(config.port, resolve));
 
-  // Warm the snarkjs module cache now, so the FIRST task never pays the
-  // ~4s cold-import cost inside its response budget (practice mode uses a
-  // tighter deadline than competition). Fire-and-forget: a failure here
-  // only means the first proof import happens lazily, as before.
-  import('snarkjs').catch((err) => {
-    log('snarkjs_warmup_failed', { error: err.message });
-  });
   log('started', {
     name: 'PEGASUS',
     port: config.port,
     kurierKeyConfigured: config.hasKurierKey,
     seenSetSize: seenSet.size,
     seenSetDegraded: seenSet.degraded,
+    warmupOk: warmup.ok,
   });
 
   let shuttingDown = false;

@@ -24,6 +24,45 @@ client, and response shaping are built and tested. Do not enter scored
 rounds until practice mode passes, including the encoding validation in
 [Known unknowns](#known-unknowns).
 
+## NEPTUN upgrade (build `neptun-1`, 15 Nov 2026)
+
+NEPTUN is an **in-place upgrade** of PEGASUS: same registration, same
+endpoint, same decision/proof mappings (already practice-validated).
+Only operational resilience changed:
+
+- **Seen-set second copy.** Every save writes `${SEEN_SET_PATH}.bak`
+  (same payload, atomic tmp+rename, after the primary). On load, a
+  missing/unreadable or corrupt primary falls back to the backup; the
+  recovery sets the degraded flag and is reported as
+  `seenSetBackupRecovered` on `GET /health`. A failed save no longer
+  poisons the save chain: later saves still run, and the next
+  successful write persists the full in-memory map.
+- **Full startup warm-up** (`src/warmup.js`, runs before listening):
+  snarkjs import, all four circuit artifacts present, both VK JSONs
+  parse, and one dummy gatekeeper REJECT proof (trap-failing inputs,
+  task id `warmup`) that must verify against the exported VK. Any
+  failure logs loudly and boot continues with `warmupOk: false` on
+  `GET /health`. The vfyPolicy circuit is not proven at boot (Steal
+  entries are locked); its artifacts + VK are still checked.
+- **Health observability.** `GET /health` adds `warmupOk`,
+  `seenSetBackupRecovered`, `gatekeeperTasks`, `gatekeeperReplays`,
+  `gatekeeperProofs`, `gatekeeperProofDegraded` (non-replay responses
+  without proof), `gatekeeperBudgetExceeded`, `stealTurns`,
+  `stealProofs`, `lastGatekeeperDurationMs`, `lastStealDurationMs`.
+  Existing fields are unchanged. The endpoint still answers HTTP 200
+  while the process is up (liveness); degraded state stays in the body.
+- **Fly native health check.** `fly.toml` adds
+  `[[http_service.checks]]` (GET `/health`, 30s grace, 15s interval,
+  5s timeout). `auto_stop_machines` stays `false` (always-on).
+- **Input hardening.** Empty/whitespace-only numeric strings are now
+  rejected in the Gatekeeper decider, the Steal policy/hash inputs, and
+  the vfyPolicy input builder (`BigInt('')` coerces to `0n` in this
+  runtime, so a blank field used to read as zero). Each call site
+  already fail-closes on the throw. `toField()` now hashes the full
+  big-endian bytes for values above 32 bytes (an odd-length hex
+  spelling previously lost its last nibble to `Buffer.from`); envelopes
+  cap at 32 bytes, so no live encoding changes.
+
 ## How it works
 
 ```
@@ -286,6 +325,8 @@ src/
   gatekeeper.js     pure decision logic
   reasonCodes.js    canonical codes + provisional trap mapping
   seenSet.js        persistent replay memory (atomic JSON file)
+  warmup.js         full startup warm-up: snarkjs import, artifact +
+                    VK checks, one dummy REJECT proof that must verify
   steal.js          policy (confirmed circuit rule), publicInputsHash,
                     response shaping
   strategyParams.js strategy values (single source) + validator

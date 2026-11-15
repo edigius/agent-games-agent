@@ -241,6 +241,141 @@ describe('server: steal end-to-end (mock proof provider)', () => {
   });
 });
 
+describe('server: health counters (NEPTUN observability)', () => {
+  const servers = [];
+
+  function getFrom(targetPort, path) {
+    return new Promise((resolve, reject) => {
+      const req = request({ host: '127.0.0.1', port: targetPort, path, method: 'GET' }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () =>
+          resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(chunks).toString('utf8')) }),
+        );
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  async function startServer(proofProvider, extra = {}) {
+    const dir = await mkdtemp(join(tmpdir(), 'pegasus-counters-'));
+    const seenSet = new SeenSet(join(dir, 'seen-set.json'));
+    await seenSet.load();
+    const srv = createServer({
+      config: { hmacSecret: SECRET, hasKurierKey: false },
+      seenSet,
+      kurier: null,
+      proofProvider,
+      ...extra,
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const entry = { server: srv, port: srv.address().port, dir };
+    servers.push(entry);
+    return entry;
+  }
+
+  after(async () => {
+    for (const { server: srv, dir } of servers) {
+      srv.closeAllConnections();
+      await new Promise((resolve) => srv.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports zero counters before traffic and exact counts after', async () => {
+    const { port: p } = await startServer(async () => MOCK_EVIDENCE, { warmupOk: true });
+    const before = await getFrom(p, '/health');
+    assert.equal(before.json.warmupOk, true);
+    assert.equal(before.json.seenSetBackupRecovered, false);
+    assert.equal(before.json.gatekeeperTasks, 0);
+    assert.equal(before.json.gatekeeperReplays, 0);
+    assert.equal(before.json.gatekeeperProofs, 0);
+    assert.equal(before.json.gatekeeperProofDegraded, 0);
+    assert.equal(before.json.gatekeeperBudgetExceeded, 0);
+    assert.equal(before.json.stealTurns, 0);
+    assert.equal(before.json.stealProofs, 0);
+    assert.equal(before.json.lastGatekeeperDurationMs, null);
+    assert.equal(before.json.lastStealDurationMs, null);
+
+    const tx = `0x${'dd'.repeat(32)}`;
+    const first = await post(
+      '/agent',
+      gatekeeperEnvelope(validGatekeeperInput({ proof_tx: tx }), { task_id: 'gk_cnt_001' }),
+      { targetPort: p },
+    );
+    assert.equal(first.json.decision, 'APPROVE');
+    const replay = await post(
+      '/agent',
+      gatekeeperEnvelope(validGatekeeperInput({ proof_tx: tx }), { task_id: 'gk_cnt_002' }),
+      { targetPort: p },
+    );
+    assert.equal(replay.json.reason_code, 'PROOF_REPLAY');
+    const turn = await post('/agent', stealEnvelope({}, { turn: 7 }), { targetPort: p });
+    assert.equal(turn.status, 200);
+
+    const after = await getFrom(p, '/health');
+    assert.equal(after.json.gatekeeperTasks, 2);
+    assert.equal(after.json.gatekeeperReplays, 1);
+    assert.equal(after.json.gatekeeperProofs, 1);
+    assert.equal(after.json.gatekeeperProofDegraded, 0);
+    assert.equal(after.json.gatekeeperBudgetExceeded, 0);
+    assert.equal(after.json.stealTurns, 1);
+    assert.equal(after.json.stealProofs, 1);
+    assert.ok(typeof after.json.lastGatekeeperDurationMs === 'number');
+    assert.ok(after.json.lastGatekeeperDurationMs >= 0);
+    assert.ok(typeof after.json.lastStealDurationMs === 'number');
+    // Existing health fields keep their meaning.
+    assert.equal(after.json.name, 'PEGASUS');
+    assert.equal(after.json.buildId, 'neptun-1');
+    assert.equal(after.json.seenSetSize, 1);
+  });
+
+  it('counts proof-less non-replay responses as degraded, warmupOk null by default', async () => {
+    const { port: p } = await startServer(async () => {
+      throw new Error('simulated proof failure');
+    });
+    const res = await post(
+      '/agent',
+      gatekeeperEnvelope(validGatekeeperInput({ proof_tx: `0x${'ee'.repeat(32)}` }), {
+        task_id: 'gk_cnt_003',
+      }),
+      { targetPort: p },
+    );
+    assert.equal(res.status, 200);
+    assert.equal('proof' in res.json, false);
+    const health = await getFrom(p, '/health');
+    assert.equal(health.json.warmupOk, null);
+    assert.equal(health.json.gatekeeperTasks, 1);
+    assert.equal(health.json.gatekeeperProofs, 0);
+    assert.equal(health.json.gatekeeperProofDegraded, 1);
+  });
+
+  it('counts watchdog firings as budget-exceeded', async () => {
+    const { port: p } = await startServer(
+      async () =>
+        new Promise((resolve) => setTimeout(() => resolve(MOCK_EVIDENCE), 1100)),
+    );
+    const res = await post(
+      '/agent',
+      gatekeeperEnvelope(validGatekeeperInput({ proof_tx: `0x${'ff'.repeat(32)}` }), {
+        task_id: 'gk_cnt_004',
+        // Past deadline: budget floors at 1000ms, provider answers at 1100ms.
+        deadline_at: new Date(Date.now() - 1000).toISOString(),
+      }),
+      { targetPort: p },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.json.decision, 'REJECT');
+    assert.equal(res.json.reason_code, 'MISSING_VERIFICATION');
+    const health = await getFrom(p, '/health');
+    assert.equal(health.json.gatekeeperTasks, 1);
+    assert.equal(health.json.gatekeeperBudgetExceeded, 1);
+    // Let the background handler settle before teardown.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  });
+});
+
 describe('server: steal end-to-end (REAL proof provider, real artifacts)', () => {
   const TEST_SALT = 777n;
   let realServer;

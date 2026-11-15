@@ -148,6 +148,35 @@ describe('gatekeeper boundaries', () => {
     );
   });
 
+  it('rejects empty/whitespace-only numeric fields (BigInt("") coerces to 0n)', () => {
+    // A blank minimum/balance/amount/block must fail closed, never read
+    // as zero: a blank minimum would pass every threshold check.
+    for (const field of ['minimum', 'public_balance', 'amount', 'max_transfer']) {
+      for (const blank of ['', '   ']) {
+        assert.throws(
+          () => decideGatekeeper(validGatekeeperInput({ [field]: blank }), {}),
+          new RegExp(field),
+        );
+      }
+    }
+    for (const blank of ['', '   ']) {
+      assert.throws(
+        () => decideGatekeeper(validGatekeeperInput({ current_block: blank }), {}),
+        /current_block/,
+      );
+      assert.throws(
+        () => decideGatekeeper(validGatekeeperInput({ expiry_block: blank }), {}),
+        /expiry_block/,
+      );
+    }
+    // Explicit zero is still a valid integer, not a blank.
+    const r = decideGatekeeper(
+      validGatekeeperInput({ minimum: '0', public_balance: '0', amount: '0', max_transfer: '0' }),
+      { isReplay: false },
+    );
+    assert.equal(r.decision, 'APPROVE');
+  });
+
   it('keeps the proof_tx value available to the caller for echo', () => {
     assert.equal(validGatekeeperInput().proof_tx, PROOF_TX);
   });

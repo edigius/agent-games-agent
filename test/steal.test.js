@@ -110,6 +110,26 @@ describe('publicInputsHash', () => {
       /unknown action/,
     );
   });
+
+  it('rejects empty/whitespace-only balances (BigInt("") coerces to 0n)', () => {
+    for (const field of ['selfBalance', 'opponentBalance']) {
+      for (const blank of ['', '   ']) {
+        assert.throws(
+          () =>
+            computePublicInputsHash({
+              commitment: COMMITMENT,
+              matchId: MATCH_ID,
+              turn: 1,
+              selfBalance: '95',
+              opponentBalance: '105',
+              action: 'HOLD',
+              [field]: blank,
+            }),
+          new RegExp(field),
+        );
+      }
+    }
+  });
 });
 
 describe('policy (confirmed circuit rule)', () => {
@@ -123,6 +143,19 @@ describe('policy (confirmed circuit rule)', () => {
   });
   // p0=5, p1=50, p2=100, p3=0: exercises every branch.
   const P = [5, 50, 100, 0, 0, 0, 0, 0];
+
+  it('rejects empty/whitespace-only balances; safePolicy fail-closes to HOLD', () => {
+    for (const field of ['selfBalance', 'opponentBalance']) {
+      for (const blank of ['', '   ']) {
+        assert.throws(() => policy(state({ [field]: blank }), P), new RegExp(field));
+        assert.deepEqual(safePolicy(state({ [field]: blank }), P), { type: 'HOLD' });
+      }
+    }
+    // Explicit zero is still a valid integer, not a blank.
+    assert.deepEqual(policy(state({ selfBalance: '0', opponentBalance: '0' }), P), {
+      type: 'FORTIFY',
+    });
+  });
 
   it('is deterministic and ignores turn + fortify flags', () => {
     const s = state({ selfBalance: '120', opponentBalance: '80' });

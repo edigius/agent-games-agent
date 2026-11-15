@@ -93,13 +93,29 @@ function keccakToField(bytes) {
   return BigInt(`0x${keccak256(bytes)}`) % BN128_FIELD_MODULUS;
 }
 
+// Big-endian value bytes for hashing. Buffer.from(hex, 'hex') SILENTLY
+// drops a trailing nibble on odd-length hex (Buffer.from('abc','hex')
+// yields <ab>), so the hex must be even-length first. padStart(64,'0')
+// alone only guarantees that for values up to 32 bytes; a longer value
+// with an odd hex length would lose its last nibble before hashing.
+// Envelopes cap at 32 bytes, so this only changes behavior for values
+// that never occur live — but the bytes hashed must be the value's
+// bytes, not a truncation of them.
+function bigIntToHashBytes(n) {
+  const hex = n.toString(16).padStart(64, '0');
+  return Buffer.from(hex.length % 2 !== 0 ? `0${hex}` : hex, 'hex');
+}
+
 /**
  * PROVISIONAL ENCODING (practice-validation item). Convert an envelope
  * value to a BN128 field element:
  *  - hex strings (0x...) and decimal integers parse to BigInt and are used
  *    directly when below the field modulus;
  *  - values at/above the modulus (e.g. most 32-byte hashes) use
- *    keccak256 of the value bytes, mod the field modulus;
+ *    keccak256 of the value bytes, mod the field modulus. The value
+ *    bytes are the full big-endian representation (see
+ *    bigIntToHashBytes): an odd-length hex spelling must be nibble-
+ *    padded first, or Buffer.from would silently drop the last nibble.
  *  - non-numeric strings (e.g. task_id "gk_...") use keccak256 of the
  *    UTF-8 bytes, mod the field modulus.
  * @returns {bigint} always < BN128_FIELD_MODULUS.
@@ -108,8 +124,7 @@ export function toField(value) {
   if (typeof value === 'bigint') {
     if (value < 0n) throw new Error('toField: negative values are not field elements');
     if (value < BN128_FIELD_MODULUS) return value;
-    const hex = value.toString(16).padStart(64, '0');
-    return keccakToField(Buffer.from(hex, 'hex'));
+    return keccakToField(bigIntToHashBytes(value));
   }
   if (typeof value === 'number') {
     if (!Number.isInteger(value) || value < 0) {
@@ -130,7 +145,7 @@ export function toField(value) {
     if (/^\d+$/.test(s)) {
       const n = BigInt(s);
       if (n < BN128_FIELD_MODULUS) return n;
-      return keccakToField(Buffer.from(n.toString(16).padStart(64, '0'), 'hex'));
+      return keccakToField(bigIntToHashBytes(n));
     }
     return keccakToField(Buffer.from(s, 'utf8'));
   }
@@ -162,6 +177,13 @@ function buildGatekeeperInput(data) {
 }
 
 function parseNonNegativeInteger(value, field) {
+  // BigInt('') and BigInt('   ') coerce to 0n in this runtime, so a
+  // blank turn/balance/amount would silently read as zero. Reject
+  // blank strings loudly; the error propagates and the server
+  // degrades to a proof-less turn response.
+  if (typeof value === 'string' && value.trim() === '') {
+    throw new Error(`vfyPolicy input ${field} is not an integer: (empty string)`);
+  }
   let n;
   try {
     n = BigInt(value);

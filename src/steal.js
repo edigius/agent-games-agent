@@ -38,6 +38,13 @@ export const EXTRACT_MAX = 10;
 export const FORTIFY_COST = 2;
 
 function toBigInt(value, field) {
+  // BigInt('') and BigInt('   ') coerce to 0n in this runtime, so an
+  // absent/blank balance would silently read as zero. Reject blank
+  // strings loudly; policy() throws (safePolicy fail-closes to HOLD)
+  // and computePublicInputsHash errors are caught by the server.
+  if (typeof value === 'string' && value.trim() === '') {
+    throw new Error(`steal state field ${field} is not an integer: (empty string)`);
+  }
   try {
     return BigInt(value);
   } catch {

@@ -31,6 +31,17 @@ primary_region = "sin"
   min_machines_running = 1
   processes = ["app"]
 
+# Liveness only: GET /health always answers HTTP 200 while the process
+# is up (a degraded state is reported in the body, not the status
+# code), so a failing check means the machine itself is down.
+[[http_service.checks]]
+  grace_period = "30s"
+  interval = "15s"
+  method = "get"
+  path = "/health"
+  protocol = "http"
+  timeout = "5s"
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "1gb"

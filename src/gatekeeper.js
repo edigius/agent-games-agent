@@ -44,6 +44,13 @@ function normalizeHex(value) {
 }
 
 function toBigInt(value, field) {
+  // BigInt('') and BigInt('   ') coerce to 0n in this runtime, so an
+  // absent/blank field would silently read as zero (a missing minimum
+  // would pass every threshold check). Reject blank strings loudly;
+  // the server fail-closes on the throw (MISSING_VERIFICATION).
+  if (typeof value === 'string' && value.trim() === '') {
+    throw new Error(`gatekeeper input field ${field} is not an integer: (empty string)`);
+  }
   try {
     return BigInt(value);
   } catch {

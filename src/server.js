@@ -72,7 +72,26 @@ export function createServer({
   seenSet,
   kurier = null,
   proofProvider = defaultProofProvider,
+  // Startup warm-up outcome from src/warmup.js. null = unknown (e.g.
+  // tests that construct a server without running warm-up).
+  warmupOk = null,
 }) {
+  // Lightweight observability for GET /health (NEPTUN): plain counters
+  // in the server closure, no external stack. Counters reflect handler
+  // completions: if the watchdog fires, the handler keeps running in
+  // the background and its proof outcome still lands here, while
+  // gatekeeperBudgetExceeded records the watchdog firing itself.
+  const metrics = {
+    gatekeeperTasks: 0,
+    gatekeeperReplays: 0,
+    gatekeeperProofs: 0,
+    gatekeeperProofDegraded: 0,
+    gatekeeperBudgetExceeded: 0,
+    stealTurns: 0,
+    stealProofs: 0,
+    lastGatekeeperDurationMs: null,
+    lastStealDurationMs: null,
+  };
   const send = (res, status, payload) => {
     const body = Buffer.from(JSON.stringify(payload));
     res.writeHead(status, {
@@ -89,6 +108,7 @@ export function createServer({
 
   async function handleGatekeeper(envelope, deadlineMs) {
     const started = Date.now();
+    metrics.gatekeeperTasks += 1;
     const input = envelope.input ?? {};
     const taskId = envelope.task_id ?? null;
     const proofTx = typeof input.proof_tx === 'string' ? input.proof_tx : null;
@@ -105,6 +125,8 @@ export function createServer({
     // NO proof generation attempt. Valid facts + REJECT is unprovable in
     // the circuit, and the docs state replay tasks carry no proof.
     if (proofTx && seenSet.has(proofTx)) {
+      metrics.gatekeeperReplays += 1;
+      metrics.lastGatekeeperDurationMs = Date.now() - started;
       log('gatekeeper_decision', {
         taskId,
         decision: 'REJECT',
@@ -186,7 +208,13 @@ export function createServer({
     if (evidence?.proof) {
       payload.proof = evidence.proof;
       payload.public_signals = evidence.publicSignals;
+      metrics.gatekeeperProofs += 1;
+    } else {
+      // Non-replay response without proof evidence (proof generation
+      // failed and degraded). Replay responses never reach this path.
+      metrics.gatekeeperProofDegraded += 1;
     }
+    metrics.lastGatekeeperDurationMs = Date.now() - started;
     log('gatekeeper_decision', {
       taskId,
       decision: decision.decision,
@@ -208,6 +236,7 @@ export function createServer({
 
   async function handleSteal(envelope, deadlineMs) {
     const started = Date.now();
+    metrics.stealTurns += 1;
     const { matchId, turn } = envelope;
     const state = envelope.state ?? {};
     const commitment = envelope.strategyCommitment?.hash ?? null;
@@ -269,6 +298,8 @@ export function createServer({
       proof: evidence?.proof ?? null,
       publicSignals: evidence?.publicSignals ?? null,
     });
+    if (evidence?.proof) metrics.stealProofs += 1;
+    metrics.lastStealDurationMs = Date.now() - started;
     log('steal_turn', {
       matchId,
       turn,
@@ -354,6 +385,7 @@ export function createServer({
         GATEKEEPER_MARGIN_MS,
       );
       return withBudget(handleGatekeeper(envelope, budget), budget, () => {
+        metrics.gatekeeperBudgetExceeded += 1;
         log('gatekeeper_budget_exceeded', { taskId: envelope.task_id ?? null });
         return failClosedGatekeeper(envelope);
       });
@@ -396,6 +428,18 @@ export function createServer({
       circuitsPresent,
       seenSetSize: seenSet.size,
       seenSetDegraded: seenSet.degraded,
+      // NEPTUN observability (additive; fields above unchanged).
+      warmupOk,
+      seenSetBackupRecovered: Boolean(seenSet.backupRecovered),
+      gatekeeperTasks: metrics.gatekeeperTasks,
+      gatekeeperReplays: metrics.gatekeeperReplays,
+      gatekeeperProofs: metrics.gatekeeperProofs,
+      gatekeeperProofDegraded: metrics.gatekeeperProofDegraded,
+      gatekeeperBudgetExceeded: metrics.gatekeeperBudgetExceeded,
+      stealTurns: metrics.stealTurns,
+      stealProofs: metrics.stealProofs,
+      lastGatekeeperDurationMs: metrics.lastGatekeeperDurationMs,
+      lastStealDurationMs: metrics.lastStealDurationMs,
     };
   }
 

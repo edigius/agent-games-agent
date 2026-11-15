@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { keccak256 } from 'js-sha3';
 import { decideGatekeeper } from '../src/gatekeeper.js';
 import {
   BN128_FIELD_MODULUS,
@@ -179,5 +180,34 @@ describe('toField encoding (provisional)', () => {
     assert.throws(() => toField(-1n), /negative/);
     assert.throws(() => toField(1.5), /non-negative integer/);
     assert.throws(() => toField(undefined), /unsupported/);
+  });
+
+  it('hashes the FULL value bytes for >32-byte values (odd 65-hex-digit quirk)', () => {
+    // 65 hex digits: padStart(64,'0') leaves it odd-length, and
+    // Buffer.from(hex,'hex') silently drops the last nibble. toField
+    // must hash all 33 big-endian bytes (leading zero nibble), in both
+    // the bigint and the decimal-string branches. Envelopes cap at 32
+    // bytes, so this pins behavior for values that never occur live.
+    const value = BigInt(`0x1${'ab'.repeat(32)}`);
+    assert.equal(value.toString(16).length, 65);
+    assert.ok(value >= BN128_FIELD_MODULUS);
+    const fullBytes = Buffer.from(`0${value.toString(16)}`, 'hex');
+    assert.equal(fullBytes.length, 33);
+    const expected = BigInt(`0x${keccak256(fullBytes)}`) % BN128_FIELD_MODULUS;
+    assert.equal(toField(value), expected);
+    assert.equal(toField(value.toString(10)), expected);
+    // And it must differ from the old truncated-nibble hash.
+    const truncated = BigInt(`0x${keccak256(Buffer.from(value.toString(16), 'hex'))}`) % BN128_FIELD_MODULUS;
+    assert.notEqual(toField(value), truncated);
+  });
+
+  it('keeps the exact 32-byte hashing behavior unchanged (no drift)', () => {
+    // 64 hex digits: the even-length fix must not alter the bytes
+    // hashed for values that already worked.
+    const value = BigInt(`0x${'ab'.repeat(32)}`);
+    const expected = BigInt(`0x${keccak256(Buffer.from(value.toString(16), 'hex'))}`) % BN128_FIELD_MODULUS;
+    assert.equal(toField(value), expected);
+    assert.equal(toField(value.toString(10)), expected);
+    assert.equal(toField(`0x${'ab'.repeat(32)}`), expected);
   });
 });

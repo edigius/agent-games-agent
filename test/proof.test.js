@@ -100,6 +100,32 @@ describe('proof adapter: vfyPolicy input validation (no proving)', () => {
     );
   });
 
+  it('refuses empty/whitespace-only turn, balances, and EXTRACT amount', async () => {
+    const base = await validData();
+    await assert.rejects(
+      buildCircuitInput('vfyPolicy', {
+        ...base,
+        envelope: { ...base.envelope, turn: '' },
+      }),
+      /turn/,
+    );
+    for (const field of ['selfBalance', 'opponentBalance']) {
+      await assert.rejects(
+        buildCircuitInput('vfyPolicy', {
+          ...base,
+          envelope: stealEnvelope({ [field]: '   ' }, {
+            strategyCommitment: base.envelope.strategyCommitment,
+          }),
+        }),
+        new RegExp(field),
+      );
+    }
+    await assert.rejects(
+      buildCircuitInput('vfyPolicy', { ...base, action: { type: 'EXTRACT', amount: '' } }),
+      /amount/,
+    );
+  });
+
   it('proveAndSubmit surfaces input errors (never degrades silently)', async () => {
     await assert.rejects(
       proveAndSubmit({ circuit: 'vfyPolicy', data: {}, kurier: null, deadlineMs: 1000 }),
